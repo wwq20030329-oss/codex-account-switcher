@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 import UniformTypeIdentifiers
@@ -25,14 +26,35 @@ private enum Defaults {
             .appendingPathComponent(".local/bin/codex-account-switcher").path
         return localPath
     }()
+    static let githubCLIPath: String? = {
+        let environment = ProcessInfo.processInfo.environment
+        let candidates = [
+            environment["GH_PATH"],
+            "/opt/homebrew/bin/gh",
+            "/usr/local/bin/gh",
+            "/usr/bin/gh",
+        ].compactMap { $0 }
+
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
     static let profilesDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".codex-account-switcher", isDirectory: true)
+    static let repositoryOwner = "wwq20030329-oss"
+    static let repositoryName = "codex-account-switcher"
+    static let repositoryURL = "https://github.com/\(repositoryOwner)/\(repositoryName)"
+    static let releasesURL = "\(repositoryURL)/releases"
+    static let latestReleaseAPIURL = "https://api.github.com/repos/\(repositoryOwner)/\(repositoryName)/releases/latest"
     static let usageURL = "https://chatgpt.com/codex/settings/usage"
     static let billingURL = "https://platform.openai.com/settings/organization/billing/overview"
     static let apiUsageURL = "https://platform.openai.com/usage"
 }
 
 private enum AppMetadata {
+    static var shortVersion: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        return info["CFBundleShortVersionString"] as? String ?? "0.0.0"
+    }
+
     static var versionLabel: String {
         let info = Bundle.main.infoDictionary ?? [:]
         let shortVersion = info["CFBundleShortVersionString"] as? String ?? "dev"
@@ -204,6 +226,26 @@ private struct CurrentAccountPayload: Decodable, Hashable {
     let current: CurrentAccountInfoPayload?
     let managedName: String?
     let managed: Bool
+}
+
+private struct ReleasePayload: Decodable, Hashable {
+    let tagName: String
+    let name: String?
+    let htmlURL: String
+    let publishedAt: String?
+    let body: String?
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case name
+        case htmlURL = "html_url"
+        case publishedAt = "published_at"
+        case body
+    }
+
+    var displayVersion: String {
+        VersionComparator.normalized(tagName)
+    }
 }
 
 private enum QuotaState {
@@ -436,6 +478,97 @@ private enum SwitcherCLIError: LocalizedError {
     }
 }
 
+private enum LaunchAtLoginState: Equatable {
+    case enabled
+    case disabled
+    case requiresApproval
+    case unavailable
+
+    var menuLabel: String {
+        switch self {
+        case .enabled:
+            return "关闭开机自启"
+        case .disabled:
+            return "开启开机自启"
+        case .requiresApproval:
+            return "关闭开机自启（待批准）"
+        case .unavailable:
+            return "开机自启不可用"
+        }
+    }
+
+    var statusLabel: String {
+        switch self {
+        case .enabled:
+            return "开机自启已开启"
+        case .disabled:
+            return "开机自启未开启"
+        case .requiresApproval:
+            return "开机自启待批准"
+        case .unavailable:
+            return "开机自启不可用"
+        }
+    }
+}
+
+private enum VersionComparator {
+    static func normalized(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("v") {
+            return String(trimmed.dropFirst())
+        }
+        return trimmed
+    }
+
+    static func isNewer(_ candidate: String, than current: String) -> Bool {
+        compare(candidate, current) == .orderedDescending
+    }
+
+    static func compare(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let left = components(from: lhs)
+        let right = components(from: rhs)
+        let maxCount = max(left.count, right.count)
+
+        for index in 0..<maxCount {
+            let leftValue = index < left.count ? left[index] : 0
+            let rightValue = index < right.count ? right[index] : 0
+            if leftValue < rightValue {
+                return .orderedAscending
+            }
+            if leftValue > rightValue {
+                return .orderedDescending
+            }
+        }
+        return .orderedSame
+    }
+
+    private static func components(from raw: String) -> [Int] {
+        normalized(raw)
+            .split(separator: ".")
+            .map { chunk in
+                let numeric = chunk.prefix { $0.isNumber }
+                return Int(numeric) ?? 0
+            }
+    }
+}
+
+private enum UpdateCheckerError: LocalizedError {
+    case noRelease
+    case invalidPayload
+    case requestFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noRelease:
+            return "还没有可检查的正式发布版本。"
+        case .invalidPayload:
+            return "更新信息格式无法解析。"
+        case let .requestFailed(message):
+            return message
+        }
+    }
+}
+
 private enum SwitcherCLI {
     static func run(_ arguments: [String]) async throws -> String {
         try await Task.detached(priority: .userInitiated) {
@@ -512,13 +645,117 @@ private enum SwitcherCLI {
     }
 }
 
+private enum UpdateChecker {
+    static func fetchLatestRelease() async throws -> ReleasePayload {
+        do {
+            return try await fetchFromGitHubAPI()
+        } catch UpdateCheckerError.noRelease {
+            if let release = try await fetchViaGitHubCLI() {
+                return release
+            }
+            throw UpdateCheckerError.noRelease
+        } catch {
+            if let release = try await fetchViaGitHubCLI() {
+                return release
+            }
+            throw error
+        }
+    }
+
+    private static func fetchFromGitHubAPI() async throws -> ReleasePayload {
+        guard let url = URL(string: Defaults.latestReleaseAPIURL) else {
+            throw UpdateCheckerError.requestFailed("更新地址无效。")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        request.setValue("CodexAccountSwitcher", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw UpdateCheckerError.requestFailed("没有收到有效的更新响应。")
+        }
+
+        switch httpResponse.statusCode {
+        case 200:
+            do {
+                return try JSONDecoder().decode(ReleasePayload.self, from: data)
+            } catch {
+                throw UpdateCheckerError.invalidPayload
+            }
+        case 404:
+            throw UpdateCheckerError.noRelease
+        default:
+            let body = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw UpdateCheckerError.requestFailed(
+                body.isEmpty
+                    ? "检查更新失败（HTTP \(httpResponse.statusCode)）。"
+                    : "检查更新失败（HTTP \(httpResponse.statusCode)）：\(body)"
+            )
+        }
+    }
+
+    private static func fetchViaGitHubCLI() async throws -> ReleasePayload? {
+        guard let ghPath = Defaults.githubCLIPath else {
+            return nil
+        }
+
+        return try await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: ghPath)
+            process.arguments = [
+                "api",
+                "repos/\(Defaults.repositoryOwner)/\(Defaults.repositoryName)/releases/latest",
+            ]
+
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            try process.run()
+            process.waitUntilExit()
+
+            let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+            let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+            let errorOutput = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            if process.terminationStatus != 0 {
+                if errorOutput.localizedCaseInsensitiveContains("404") {
+                    return nil
+                }
+                if errorOutput.localizedCaseInsensitiveContains("not found") {
+                    return nil
+                }
+                throw UpdateCheckerError.requestFailed(
+                    errorOutput.isEmpty ? "GitHub CLI 检查更新失败。" : errorOutput
+                )
+            }
+
+            do {
+                return try JSONDecoder().decode(ReleasePayload.self, from: outputData)
+            } catch {
+                throw UpdateCheckerError.invalidPayload
+            }
+        }.value
+    }
+}
+
 @MainActor
 private final class ProfileStore: ObservableObject {
     private static let autoRefreshInterval: TimeInterval = 180
+    private static let automaticUpdateCheckInterval: TimeInterval = 86_400
     private static let lastQuotaAlertKey = "CodexSwitcher.lastQuotaAlertKey"
     private static let showUsableOnlyKey = "CodexSwitcher.showUsableOnly"
     private static let sortModeKey = "CodexSwitcher.sortMode"
     private static let accountWatchPollInterval: UInt64 = 2_000_000_000
+    private static let lastUpdateCheckAtKey = "CodexSwitcher.lastUpdateCheckAt"
+    private static let lastNotifiedReleaseKey = "CodexSwitcher.lastNotifiedRelease"
 
     @Published var profiles: [ProfilePayload] = []
     @Published var isLoading = false
@@ -530,18 +767,23 @@ private final class ProfileStore: ObservableObject {
     @Published var isWatchingNewAccounts = false
     @Published var searchQuery = ""
     @Published var planFilter: PlanFilter = .all
+    @Published var launchAtLoginState: LaunchAtLoginState = .unavailable
+    @Published var latestAvailableVersion: String?
 
     private var autoRefreshTimer: Timer?
     private var refreshTask: Task<Void, Never>?
     private var pendingRefreshMode: RefreshMode?
     private var pendingRefreshSilent = true
     private var accountWatchTask: Task<Void, Never>?
+    private var updateCheckTask: Task<Void, Never>?
     private var watchedIdentityKey: String?
     private let notificationCenter = UNUserNotificationCenter.current()
 
     init() {
         configureNotifications()
+        refreshLaunchAtLoginState()
         startAutoRefresh()
+        checkForUpdatesIfNeeded()
     }
 
     var orderedProfiles: [ProfilePayload] {
@@ -854,6 +1096,10 @@ private final class ProfileStore: ObservableObject {
         openURL(Defaults.apiUsageURL)
     }
 
+    func openReleasesPage() {
+        openURL(Defaults.releasesURL)
+    }
+
     func openProfilesDirectory() {
         NSWorkspace.shared.open(Defaults.profilesDirectoryURL)
     }
@@ -861,8 +1107,99 @@ private final class ProfileStore: ObservableObject {
     func showAbout() {
         PromptCenter.info(
             title: "Codex Account Switcher",
-            message: "\(AppMetadata.versionLabel)\n\n本地菜单栏工具，用来保存和切换 Codex 账号档案。\n\n档案目录：\(Defaults.profilesDirectoryURL.path)"
+            message: "\(AppMetadata.versionLabel)\n\n本地菜单栏工具，用来保存和切换 Codex 账号档案。\n\n档案目录：\(Defaults.profilesDirectoryURL.path)\n发布页：\(Defaults.releasesURL)"
         )
+    }
+
+    func toggleLaunchAtLogin() {
+        guard #available(macOS 13.0, *) else {
+            statusMessage = "当前系统不支持开机自启管理。"
+            return
+        }
+
+        do {
+            let service = SMAppService.mainApp
+            switch launchAtLoginState {
+            case .enabled, .requiresApproval:
+                try service.unregister()
+                refreshLaunchAtLoginState()
+                statusMessage = "已关闭开机自启。"
+            case .disabled:
+                try service.register()
+                refreshLaunchAtLoginState()
+                switch launchAtLoginState {
+                case .requiresApproval:
+                    statusMessage = "已请求开启开机自启，请在系统设置的“登录项”中允许它。"
+                    PromptCenter.info(
+                        title: "开机自启待系统批准",
+                        message: "我已经请求开启开机自启。请到“系统设置 > 通用 > 登录项”里允许 Codex Account Switcher。"
+                    )
+                case .enabled:
+                    statusMessage = "已开启开机自启。"
+                case .disabled, .unavailable:
+                    statusMessage = "开机自启设置已更新。"
+                }
+            case .unavailable:
+                statusMessage = "当前构建环境暂不支持开机自启。"
+            }
+        } catch {
+            statusMessage = "设置开机自启失败：\(error.localizedDescription)"
+            PromptCenter.info(title: "无法设置开机自启", message: error.localizedDescription)
+        }
+    }
+
+    func checkForUpdates(manual: Bool = true) {
+        if updateCheckTask != nil {
+            if manual {
+                statusMessage = "正在检查更新，请稍候。"
+            }
+            return
+        }
+
+        updateCheckTask = Task {
+            defer { updateCheckTask = nil }
+            do {
+                let release = try await UpdateChecker.fetchLatestRelease()
+                UserDefaults.standard.set(Date(), forKey: Self.lastUpdateCheckAtKey)
+                latestAvailableVersion = nil
+
+                if VersionComparator.isNewer(release.displayVersion, than: AppMetadata.shortVersion) {
+                    latestAvailableVersion = release.displayVersion
+                    let current = AppMetadata.shortVersion
+                    let message = "发现新版本 \(release.displayVersion)，当前是 \(current)。"
+                    statusMessage = message
+
+                    let notifiedKey = UserDefaults.standard.string(forKey: Self.lastNotifiedReleaseKey)
+                    if notifiedKey != release.displayVersion {
+                        postNotification(
+                            title: "Codex Account Switcher 有新版本",
+                            body: "\(release.displayVersion) 已可用。"
+                        )
+                        UserDefaults.standard.set(release.displayVersion, forKey: Self.lastNotifiedReleaseKey)
+                    }
+
+                    if manual {
+                        let shouldOpen = PromptCenter.confirmAction(
+                            title: "发现新版本 \(release.displayVersion)",
+                            message: "当前版本是 \(AppMetadata.shortVersion)。现在打开发布页吗？",
+                            confirmTitle: "打开发布页",
+                            cancelTitle: "稍后"
+                        )
+                        if shouldOpen {
+                            openURL(release.htmlURL)
+                        }
+                    }
+                } else if manual {
+                    statusMessage = "当前已经是最新版本 \(AppMetadata.shortVersion)。"
+                }
+            } catch {
+                if manual {
+                    let message = error.localizedDescription
+                    statusMessage = message
+                    PromptCenter.info(title: "检查更新失败", message: message)
+                }
+            }
+        }
     }
 
     func exportBackup() {
@@ -882,6 +1219,36 @@ private final class ProfileStore: ObservableObject {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    private func refreshLaunchAtLoginState() {
+        guard #available(macOS 13.0, *) else {
+            launchAtLoginState = .unavailable
+            return
+        }
+
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            launchAtLoginState = .enabled
+        case .notRegistered:
+            launchAtLoginState = .disabled
+        case .requiresApproval:
+            launchAtLoginState = .requiresApproval
+        case .notFound:
+            launchAtLoginState = .unavailable
+        @unknown default:
+            launchAtLoginState = .unavailable
+        }
+    }
+
+    private func checkForUpdatesIfNeeded() {
+        let lastCheckedAt = UserDefaults.standard.object(forKey: Self.lastUpdateCheckAtKey) as? Date
+        if let lastCheckedAt,
+           Date().timeIntervalSince(lastCheckedAt) < Self.automaticUpdateCheckInterval
+        {
+            return
+        }
+        checkForUpdates(manual: false)
     }
 
     private func startAutoRefresh() {
@@ -1136,6 +1503,17 @@ private enum PromptCenter {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "删除")
         alert.addButton(withTitle: "取消")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    static func confirmAction(title: String, message: String, confirmTitle: String, cancelTitle: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: cancelTitle)
         return alert.runModal() == .alertFirstButtonReturn
     }
 
@@ -1708,6 +2086,11 @@ private struct DashboardView: View {
                         store.toggleContinuousAddMode()
                     }
 
+                    Button(store.launchAtLoginState.menuLabel) {
+                        store.toggleLaunchAtLogin()
+                    }
+                    .disabled(store.launchAtLoginState == .unavailable)
+
                     Divider()
 
                     Button("切换排序：\(store.sortMode.label)") {
@@ -1734,6 +2117,14 @@ private struct DashboardView: View {
 
                     Button("打开账单") {
                         store.openBilling()
+                    }
+
+                    Button("检查更新") {
+                        store.checkForUpdates()
+                    }
+
+                    Button("打开发布页") {
+                        store.openReleasesPage()
                     }
 
                     Divider()
@@ -1769,6 +2160,11 @@ private struct DashboardView: View {
                 Text(store.autoRefreshLabel)
                     .font(.system(size: 11, weight: .medium))
                 Spacer()
+                if let latestAvailableVersion = store.latestAvailableVersion {
+                    Text("新版本 \(latestAvailableVersion)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Color(red: 0.15, green: 0.59, blue: 0.42))
+                }
                 Text(AppMetadata.versionLabel)
                     .font(.system(size: 10, weight: .semibold))
             }

@@ -14,6 +14,8 @@ It combines a SwiftUI menu bar frontend with a bundled Python CLI backend, so yo
 - Highlight the best account to use next
 - Send low-quota notifications for the current active account
 - Capture multiple accounts in sequence with continuous add mode
+- Toggle launch at login from inside the app
+- Check for newer published versions from the app
 - Bundle the backend CLI, app icon, and build metadata into the app bundle
 
 ## Install
@@ -88,11 +90,19 @@ The app stores local Codex auth snapshots and app session state under:
 
 The repository does not contain account snapshots or tokens.
 
+## Product Polish
+
+- `More -> Launch at Login` can register the app as a macOS login item
+- `More -> Check for Updates` checks the latest published GitHub release
+- `More -> Open Profiles Directory` jumps straight to the local snapshot folder
+- The footer shows the current build version and highlights a newer available version when detected
+
 ## Known Limitations
 
 - This is a local-session tool, not a true multi-login Codex manager.
 - Some account actions can still require Codex re-authentication or MFA.
 - Quota and usage data depend on the currently available Codex endpoints and the current local login state.
+- Update checks work best once the repository has published GitHub releases.
 - The app is macOS-only.
 
 ## Project Layout

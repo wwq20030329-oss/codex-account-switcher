@@ -7,6 +7,7 @@ This file is a lightweight guide for publishing and maintaining Codex Account Sw
 - Run `./build.sh`
 - Run `./scripts/install.sh`
 - Open the built app and verify the menu bar icon, account list, and refresh flow
+- Check that `More -> Check for Updates` can see the intended latest release
 - Confirm the app opens the bundled backend CLI correctly
 - Check that the README still matches the current UI
 - Review the repository for accidental local paths or credentials
@@ -24,6 +25,8 @@ For GitHub releases, publish a zip containing:
 - `Codex Account Switcher.app`
 - the short release notes
 - any setup caveats, such as the need for macOS and local login state
+
+The in-app update checker reads the latest GitHub release, so create a proper release entry instead of only pushing commits.
 
 ## Suggested Release Notes
 

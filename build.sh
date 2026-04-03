@@ -23,6 +23,7 @@ xcrun swiftc \
   -framework AppKit \
   -framework SwiftUI \
   -framework Foundation \
+  -framework ServiceManagement \
   -framework UserNotifications \
   -o "$STAGING_APP/Contents/MacOS/$EXECUTABLE_NAME" \
   "$SOURCE_FILE"
