@@ -120,3 +120,7 @@ The repository does not contain account snapshots or tokens.
 - This project is not affiliated with OpenAI.
 - Version metadata is embedded from the current git repository when available.
 - If the app cannot find the bundled backend, it falls back to `~/.local/bin/codex-account-switcher`.
+
+## License
+
+MIT
