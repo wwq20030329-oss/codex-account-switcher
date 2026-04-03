@@ -46,6 +46,14 @@ The build output is also available in:
 dist/Codex Account Switcher.app
 ```
 
+## Usage
+
+- Launch the installed app from `~/Applications/Codex Account Switcher.app`
+- Save each logged-in Codex account as a separate profile
+- Use the menu bar panel to search, sort, inspect quota, and switch quickly
+- Use `More -> Launch at Login` to keep the app available after restarting macOS
+- Use `Refresh` when you want to update saved quota data across accounts
+
 ## First Use
 
 1. Open Codex and log in to one account.
