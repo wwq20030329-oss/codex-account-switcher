@@ -63,7 +63,11 @@ fi
 
 if [[ -f "$ICON_SOURCE" ]]; then
   cp "$ICON_SOURCE" "$STAGING_APP/Contents/Resources/AppIcon.icns"
-  /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$STAGING_APP/Contents/Info.plist"
+  if /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$STAGING_APP/Contents/Info.plist" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$STAGING_APP/Contents/Info.plist"
+  else
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$STAGING_APP/Contents/Info.plist"
+  fi
 fi
 
 chmod +x "$STAGING_APP/Contents/MacOS/$EXECUTABLE_NAME"
