@@ -2,59 +2,102 @@
 
 Codex Account Switcher is a native macOS menu bar app for saving multiple local Codex login snapshots and switching between them quickly.
 
-It pairs a SwiftUI menu bar frontend with a bundled Python CLI that manages local profile snapshots, usage lookups, refresh timing, and account switching.
+It combines:
 
-## What It Does
+- a SwiftUI menu bar frontend
+- a bundled Python CLI backend
+- local snapshot storage for Codex auth and app session state
 
-- Saves the current local Codex login state as a named profile
-- Switches between saved profiles with one click
-- Shows Codex plan and quota state for each profile
-- Highlights the best account to switch to next
-- Supports low-quota notifications, search, sorting, and filtering
-- Supports continuous add mode for capturing multiple accounts in sequence
+This project is intended for personal local account management on macOS.
+
+## Features
+
+- Save the current local Codex login state as a named profile
+- Switch between saved profiles with one click
+- Display per-account Codex quota and plan information
+- Sort by smart score or `5h` remaining quota
+- Search by profile name, email, or plan
+- Highlight the best account to switch to next
+- Low-quota notifications for the current active account
+- Continuous add mode for importing multiple accounts in sequence
+- Native app icon, bundled backend CLI, and reproducible local build
 
 ## How It Works
 
-The app uses the current local Codex auth state and app storage on your Mac, then stores per-account snapshots under:
+The app reads the current local Codex login state on your Mac and stores per-account snapshots under:
 
-- `~/.codex-account-switcher`
+```text
+~/.codex-account-switcher
+```
 
-No account snapshots are stored in this repository.
+The repository does not contain account snapshots or tokens.
 
-## Project Layout
+## Quick Start
 
-- `CodexMenuBarApp.swift` — native menu bar app
-- `scripts/codex-account-switcher` — bundled CLI backend
-- `build.sh` — local build script that outputs the app bundle into `dist/`
-
-## Build
+Build the app:
 
 ```bash
 ./build.sh
 ```
 
-By default, the built app is written to:
+Install it into your user Applications folder:
+
+```bash
+./scripts/install.sh
+```
+
+Open the built app from:
 
 ```text
 dist/Codex Account Switcher.app
 ```
 
-You can override the output path if needed:
+Or, after install:
+
+```text
+~/Applications/Codex Account Switcher.app
+```
+
+## Build Outputs
+
+By default, `build.sh` writes the app bundle to:
+
+```text
+dist/Codex Account Switcher.app
+```
+
+You can override the output path:
 
 ```bash
 TARGET_APP="$HOME/Desktop/Codex Account Switcher.app" ./build.sh
 ```
+
+The build also embeds:
+
+- the bundled CLI backend
+- the app icon
+- app version metadata from the current git repository when available
 
 ## Runtime CLI Resolution
 
 At launch, the app resolves the backend CLI in this order:
 
 1. `CODEX_SWITCHER_CLI_PATH`
-2. Bundled app resource: `codex-account-switcher`
+2. the bundled app resource `codex-account-switcher`
 3. `~/.local/bin/codex-account-switcher`
+
+## Project Layout
+
+- `CodexMenuBarApp.swift` — native menu bar app
+- `build.sh` — app build script
+- `assets/AppIcon.icns` — bundled app icon
+- `scripts/codex-account-switcher` — CLI backend
+- `scripts/generate_icon.swift` — icon generation helper
+- `scripts/install.sh` — install built app to `~/Applications`
 
 ## Notes
 
 - This project is not affiliated with OpenAI.
 - Usage display depends on the current Codex login state and available endpoints.
-- The app is intended for personal local account management on macOS.
+- The app is designed around local session snapshots, not true multi-session sign-in.
+- This is a macOS-only project.

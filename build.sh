@@ -10,6 +10,8 @@ ICON_SOURCE="${ICON_SOURCE:-$SOURCE_DIR/assets/AppIcon.icns}"
 BUILD_ROOT="${BUILD_ROOT:-/tmp/CodexAccountSwitcherBuild}"
 STAGING_APP="$BUILD_ROOT/$APP_NAME.app"
 TARGET_APP="${TARGET_APP:-$SOURCE_DIR/dist/$APP_NAME.app}"
+VERSION="${VERSION:-$(git -C "$SOURCE_DIR" describe --tags --abbrev=0 2>/dev/null || echo 1.0.0)}"
+BUILD_NUMBER="${BUILD_NUMBER:-$(git -C "$SOURCE_DIR" rev-list --count HEAD 2>/dev/null || echo 1)}"
 
 rm -rf "$BUILD_ROOT"
 mkdir -p "$STAGING_APP/Contents/MacOS" "$STAGING_APP/Contents/Resources"
@@ -25,7 +27,7 @@ xcrun swiftc \
   -o "$STAGING_APP/Contents/MacOS/$EXECUTABLE_NAME" \
   "$SOURCE_FILE"
 
-cat > "$STAGING_APP/Contents/Info.plist" <<'PLIST'
+cat > "$STAGING_APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -43,9 +45,9 @@ cat > "$STAGING_APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0</string>
+  <string>${VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>${BUILD_NUMBER}</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSHighResolutionCapable</key>

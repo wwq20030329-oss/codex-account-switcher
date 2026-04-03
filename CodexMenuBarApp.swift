@@ -25,9 +25,20 @@ private enum Defaults {
             .appendingPathComponent(".local/bin/codex-account-switcher").path
         return localPath
     }()
+    static let profilesDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex-account-switcher", isDirectory: true)
     static let usageURL = "https://chatgpt.com/codex/settings/usage"
     static let billingURL = "https://platform.openai.com/settings/organization/billing/overview"
     static let apiUsageURL = "https://platform.openai.com/usage"
+}
+
+private enum AppMetadata {
+    static var versionLabel: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let shortVersion = info["CFBundleShortVersionString"] as? String ?? "dev"
+        let buildVersion = info["CFBundleVersion"] as? String ?? "1"
+        return "v\(shortVersion) (\(buildVersion))"
+    }
 }
 
 private struct UsageWindow: Decodable, Hashable {
@@ -841,6 +852,17 @@ private final class ProfileStore: ObservableObject {
     func openBilling() {
         openURL(activeProfile?.usage?.billingUrl ?? Defaults.billingURL)
         openURL(Defaults.apiUsageURL)
+    }
+
+    func openProfilesDirectory() {
+        NSWorkspace.shared.open(Defaults.profilesDirectoryURL)
+    }
+
+    func showAbout() {
+        PromptCenter.info(
+            title: "Codex Account Switcher",
+            message: "\(AppMetadata.versionLabel)\n\n本地菜单栏工具，用来保存和切换 Codex 账号档案。\n\n档案目录：\(Defaults.profilesDirectoryURL.path)"
+        )
     }
 
     func exportBackup() {
@@ -1702,12 +1724,22 @@ private struct DashboardView: View {
 
                     Divider()
 
+                    Button("打开档案目录") {
+                        store.openProfilesDirectory()
+                    }
+
                     Button("打开 Codex 用量页") {
                         store.openUsagePage()
                     }
 
                     Button("打开账单") {
                         store.openBilling()
+                    }
+
+                    Divider()
+
+                    Button("关于此 App") {
+                        store.showAbout()
                     }
                 } label: {
                     Label("更多", systemImage: "ellipsis.circle")
@@ -1737,6 +1769,8 @@ private struct DashboardView: View {
                 Text(store.autoRefreshLabel)
                     .font(.system(size: 11, weight: .medium))
                 Spacer()
+                Text(AppMetadata.versionLabel)
+                    .font(.system(size: 10, weight: .semibold))
             }
             .foregroundStyle(Color(nsColor: .secondaryLabelColor))
 
