@@ -632,16 +632,24 @@ def credits_summary_text(credits: dict[str, Any] | None) -> str:
 
 def usage_summary_text(usage: dict[str, Any] | None) -> str:
     if not isinstance(usage, dict):
-        return "额度未知"
+        return "未获取额度"
 
-    plan = usage.get("plan_display") or usage.get("plan_type") or "未知套餐"
+    awaiting_fetch = usage.get("source") == "profile-cache" and not usage.get("checked_at")
+    plan = usage.get("plan_display") or usage.get("plan_type")
+    if not plan:
+        if awaiting_fetch:
+            plan = "未获取额度"
+        elif usage.get("error"):
+            plan = "读取失败"
+        else:
+            plan = "未获取额度"
     primary_window = usage.get("primary_window")
     primary_remaining = None if not isinstance(primary_window, dict) else primary_window.get("remaining_percent")
     secondary_window = usage.get("secondary_window")
     secondary_remaining = None if not isinstance(secondary_window, dict) else secondary_window.get("remaining_percent")
     if (
         usage.get("error")
-        and plan == "未知套餐"
+        and plan in {"未获取额度", "读取失败"}
         and primary_remaining is None
         and secondary_remaining is None
     ):

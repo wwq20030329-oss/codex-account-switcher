@@ -39,6 +39,9 @@ private enum Defaults {
     }()
     static let profilesDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".codex-account-switcher", isDirectory: true)
+    static let userInstalledAppURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Applications/Codex Account Switcher.app", isDirectory: true)
+    static let systemInstalledAppURL = URL(fileURLWithPath: "/Applications/Codex Account Switcher.app", isDirectory: true)
     static let repositoryOwner = "wwq20030329-oss"
     static let repositoryName = "codex-account-switcher"
     static let repositoryURL = "https://github.com/\(repositoryOwner)/\(repositoryName)"
@@ -47,6 +50,13 @@ private enum Defaults {
     static let usageURL = "https://chatgpt.com/codex/settings/usage"
     static let billingURL = "https://platform.openai.com/settings/organization/billing/overview"
     static let apiUsageURL = "https://platform.openai.com/usage"
+}
+
+private extension String {
+    var appleScriptEscaped: String {
+        replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
 }
 
 private enum AppMetadata {
@@ -88,6 +98,7 @@ private struct UsagePayload: Decodable, Hashable {
     let cached: Bool?
     let error: String?
     let stale: Bool?
+    let source: String?
 }
 
 private struct ProfilePayload: Decodable, Identifiable, Hashable {
@@ -106,7 +117,19 @@ private struct ProfilePayload: Decodable, Identifiable, Hashable {
     }
 
     var plan: String {
-        usage?.planDisplay ?? usage?.planType ?? "未知套餐"
+        if let display = usage?.planDisplay, !display.isEmpty {
+            return display
+        }
+        if let type = usage?.planType, !type.isEmpty {
+            return type.capitalized
+        }
+        if isAwaitingUsageFetch {
+            return "未获取额度"
+        }
+        if usageError != nil {
+            return "读取失败"
+        }
+        return "未获取额度"
     }
 
     var primaryRemaining: Int? {
@@ -127,6 +150,52 @@ private struct ProfilePayload: Decodable, Identifiable, Hashable {
 
     var secondaryResetAt: String? {
         usage?.secondaryWindow?.resetAt
+    }
+
+    var usageError: String? {
+        guard let error = usage?.error?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !error.isEmpty
+        else {
+            return nil
+        }
+        return error
+    }
+
+    var isAwaitingUsageFetch: Bool {
+        guard let usage else {
+            return true
+        }
+        if usage.source == "profile-cache" {
+            return true
+        }
+        return usage.checkedAt == nil && usageError == nil && usage.planDisplay == nil && usage.planType == nil
+    }
+
+    var needsRepair: Bool {
+        usageError != nil
+    }
+
+    var needsResaveRepair: Bool {
+        guard let usageError else {
+            return false
+        }
+        return usageError.contains("档案缺少登录快照")
+    }
+
+    var repairSummary: String? {
+        guard let usageError else {
+            return nil
+        }
+        if usageError.contains("档案缺少登录快照") {
+            return "档案快照缺失，需要重新保存"
+        }
+        if usageError.contains("重新登录")
+            || usageError.localizedCaseInsensitiveContains("401")
+            || usageError.localizedCaseInsensitiveContains("403")
+        {
+            return "登录态可能失效，需要重新登录"
+        }
+        return "额度读取失败，可尝试修复"
     }
 
     var quotaState: QuotaState {
@@ -482,6 +551,7 @@ private enum LaunchAtLoginState: Equatable {
     case enabled
     case disabled
     case requiresApproval
+    case requiresInstalledCopy
     case unavailable
 
     var menuLabel: String {
@@ -492,6 +562,8 @@ private enum LaunchAtLoginState: Equatable {
             return "开启开机自启"
         case .requiresApproval:
             return "关闭开机自启（待批准）"
+        case .requiresInstalledCopy:
+            return "请改用安装版开启"
         case .unavailable:
             return "开机自启不可用"
         }
@@ -505,6 +577,8 @@ private enum LaunchAtLoginState: Equatable {
             return "开机自启未开启"
         case .requiresApproval:
             return "开机自启待批准"
+        case .requiresInstalledCopy:
+            return "请从安装版运行"
         case .unavailable:
             return "开机自启不可用"
         }
@@ -746,6 +820,107 @@ private enum UpdateChecker {
     }
 }
 
+private enum LoginItemManager {
+    private static let appName = "Codex Account Switcher"
+
+    static func isEnabled(for appURL: URL) -> Bool {
+        (try? currentPaths())?.contains(appURL.standardizedFileURL.path) ?? false
+    }
+
+    static func register(appURL: URL) throws {
+        let targetPath = appURL.standardizedFileURL.path.appleScriptEscaped
+        let targetName = appName.appleScriptEscaped
+        let script = """
+        tell application "System Events"
+            set targetPath to "\(targetPath)"
+            set targetName to "\(targetName)"
+            repeat with existingItem in login items
+                try
+                    if name of existingItem is targetName then
+                        if POSIX path of (path of existingItem) is targetPath then
+                            return "exists"
+                        end if
+                    end if
+                end try
+            end repeat
+            make login item at end with properties {name:targetName, path:targetPath, hidden:false}
+            return "added"
+        end tell
+        """
+        _ = try runAppleScript(script)
+    }
+
+    static func unregister(appURL: URL) throws {
+        let targetPath = appURL.standardizedFileURL.path.appleScriptEscaped
+        let targetName = appName.appleScriptEscaped
+        let script = """
+        tell application "System Events"
+            set targetPath to "\(targetPath)"
+            set targetName to "\(targetName)"
+            repeat with existingItem in (every login item)
+                try
+                    if name of existingItem is targetName or POSIX path of (path of existingItem) is targetPath then
+                        delete existingItem
+                    end if
+                end try
+            end repeat
+            return "removed"
+        end tell
+        """
+        _ = try runAppleScript(script)
+    }
+
+    private static func currentPaths() throws -> Set<String> {
+        let script = """
+        tell application "System Events"
+            set outputLines to {}
+            repeat with existingItem in (every login item)
+                try
+                    set end of outputLines to POSIX path of (path of existingItem)
+                end try
+            end repeat
+            return outputLines as string
+        end tell
+        """
+        let output = try runAppleScript(script)
+        let parts = output
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return Set(parts)
+    }
+
+    @discardableResult
+    private static func runAppleScript(_ script: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+        let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outputData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let errorOutput = String(data: errorData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            throw SwitcherCLIError.executionFailed(
+                errorOutput.isEmpty ? "无法修改系统登录项。" : errorOutput
+            )
+        }
+
+        return output
+    }
+}
+
 @MainActor
 private final class ProfileStore: ObservableObject {
     private static let autoRefreshInterval: TimeInterval = 180
@@ -776,6 +951,7 @@ private final class ProfileStore: ObservableObject {
     private var pendingRefreshSilent = true
     private var accountWatchTask: Task<Void, Never>?
     private var updateCheckTask: Task<Void, Never>?
+    private var statusClearTask: Task<Void, Never>?
     private var watchedIdentityKey: String?
     private let notificationCenter = UNUserNotificationCenter.current()
 
@@ -946,12 +1122,38 @@ private final class ProfileStore: ObservableObject {
                 lastUpdated = Date()
                 handleQuotaAlerts(previousActiveProfile: previousActiveProfile)
                 if !autoSavedMessage.isEmpty {
-                    statusMessage = autoSavedMessage
+                    setStatusMessage(autoSavedMessage, autoClearAfter: 4)
                 } else if !silent {
-                    statusMessage = nil
+                    setStatusMessage(nil)
                 }
             } catch {
-                statusMessage = error.localizedDescription
+                setStatusMessage(error.localizedDescription)
+            }
+        }
+    }
+
+    func dismissStatusMessage() {
+        setStatusMessage(nil)
+    }
+
+    private func setStatusMessage(_ message: String?, autoClearAfter: TimeInterval? = nil) {
+        statusClearTask?.cancel()
+        statusClearTask = nil
+        statusMessage = message
+
+        guard let message, let autoClearAfter else {
+            return
+        }
+
+        statusClearTask = Task { [weak self] in
+            let duration = UInt64(autoClearAfter * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: duration)
+            await MainActor.run {
+                guard self?.statusMessage == message else {
+                    return
+                }
+                self?.statusMessage = nil
+                self?.statusClearTask = nil
             }
         }
     }
@@ -1008,16 +1210,19 @@ private final class ProfileStore: ObservableObject {
                     ?? currentAccount.current?.name
                     ?? currentAccount.current?.accountId
                     ?? "当前账号"
-                statusMessage = autoSavedMessage.isEmpty
-                    ? "连续添加已开启。现在去 Codex 登录下一个账号，我会自动保存。"
-                    : autoSavedMessage
+                setStatusMessage(
+                    autoSavedMessage.isEmpty
+                        ? "连续添加已开启。现在去 Codex 登录下一个账号，我会自动保存。"
+                        : autoSavedMessage,
+                    autoClearAfter: 6
+                )
                 postNotification(
                     title: "连续添加已开启",
                     body: "当前基准账号：\(baselineName)。你继续登录新账号时，我会自动加入切换器。"
                 )
                 startAccountWatchLoop()
             } catch {
-                statusMessage = error.localizedDescription
+                setStatusMessage(error.localizedDescription)
                 PromptCenter.info(title: "无法开启连续添加", message: error.localizedDescription)
             }
         }
@@ -1025,7 +1230,7 @@ private final class ProfileStore: ObservableObject {
 
     func quickSwitch() {
         guard let recommendedProfile else {
-            statusMessage = "暂时没有可直接接力的可用账号。"
+            setStatusMessage("暂时没有可直接接力的可用账号。", autoClearAfter: 4)
             return
         }
         switchTo(recommendedProfile)
@@ -1055,12 +1260,12 @@ private final class ProfileStore: ObservableObject {
         watchedIdentityKey = nil
         isWatchingNewAccounts = false
         if notify {
-            statusMessage = "连续添加已停止。"
+            setStatusMessage("连续添加已停止。", autoClearAfter: 4)
         }
     }
 
     func switchTo(_ profile: ProfilePayload) {
-        statusMessage = "正在切换到 \(profile.profileName)..."
+        setStatusMessage("正在切换到 \(profile.profileName)...")
         closeMenuWindow()
         runAction(arguments: ["switch", profile.profileName], showSuccessAlert: false)
     }
@@ -1104,6 +1309,53 @@ private final class ProfileStore: ObservableObject {
         NSWorkspace.shared.open(Defaults.profilesDirectoryURL)
     }
 
+    private var currentAppURL: URL {
+        Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private var preferredInstalledAppURL: URL? {
+        let candidates = [
+            Defaults.userInstalledAppURL,
+            Defaults.systemInstalledAppURL,
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }?
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+    }
+
+    private var isRunningInstalledCopy: Bool {
+        guard let installedURL = preferredInstalledAppURL else {
+            return false
+        }
+        return currentAppURL == installedURL
+    }
+
+    func openInstalledApp(terminateCurrent: Bool = false) {
+        guard let installedURL = preferredInstalledAppURL else {
+            setStatusMessage("没有找到安装版。请先打开 ~/Applications 里的 Codex Account Switcher。", autoClearAfter: 6)
+            return
+        }
+
+        NSWorkspace.shared.openApplication(at: installedURL, configuration: .init()) { _, _ in
+            guard terminateCurrent else {
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    func openCodexApp() {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
+            NSWorkspace.shared.openApplication(at: appURL, configuration: .init()) { _, _ in }
+            return
+        }
+        if let fallbackURL = URL(string: "file:///Applications/Codex.app") {
+            NSWorkspace.shared.open(fallbackURL)
+        }
+    }
+
     func showAbout() {
         PromptCenter.info(
             title: "Codex Account Switcher",
@@ -1113,7 +1365,22 @@ private final class ProfileStore: ObservableObject {
 
     func toggleLaunchAtLogin() {
         guard #available(macOS 13.0, *) else {
-            statusMessage = "当前系统不支持开机自启管理。"
+            setStatusMessage("当前系统不支持开机自启管理。", autoClearAfter: 5)
+            return
+        }
+
+        guard isRunningInstalledCopy else {
+            let shouldOpenInstalled = PromptCenter.confirmAction(
+                title: "请改用安装版",
+                message: "你现在打开的是桌面副本，macOS 对这类副本的开机自启支持不稳定。\n\n我建议直接打开 ~/Applications 里的安装版，再在那里开启开机自启。",
+                confirmTitle: "打开安装版",
+                cancelTitle: "取消"
+            )
+            guard shouldOpenInstalled else {
+                return
+            }
+            openInstalledApp(terminateCurrent: true)
+            setStatusMessage("已切到安装版。请在新打开的窗口里再次点“开机自启”。", autoClearAfter: 6)
             return
         }
 
@@ -1121,37 +1388,64 @@ private final class ProfileStore: ObservableObject {
             let service = SMAppService.mainApp
             switch launchAtLoginState {
             case .enabled, .requiresApproval:
-                try service.unregister()
-                refreshLaunchAtLoginState()
-                statusMessage = "已关闭开机自启。"
-            case .disabled:
-                try service.register()
-                refreshLaunchAtLoginState()
-                switch launchAtLoginState {
-                case .requiresApproval:
-                    statusMessage = "已请求开启开机自启，请在系统设置的“登录项”中允许它。"
-                    PromptCenter.info(
-                        title: "开机自启待系统批准",
-                        message: "我已经请求开启开机自启。请到“系统设置 > 通用 > 登录项”里允许 Codex Account Switcher。"
-                    )
-                case .enabled:
-                    statusMessage = "已开启开机自启。"
-                case .disabled, .unavailable:
-                    statusMessage = "开机自启设置已更新。"
+                if service.status == .notFound {
+                    try LoginItemManager.unregister(appURL: currentAppURL)
+                } else {
+                    try service.unregister()
                 }
+                refreshLaunchAtLoginState()
+                setStatusMessage("已关闭开机自启。", autoClearAfter: 5)
+            case .disabled:
+                if service.status == .notFound {
+                    try LoginItemManager.register(appURL: currentAppURL)
+                    refreshLaunchAtLoginState()
+                    setStatusMessage("已通过系统登录项开启开机自启。", autoClearAfter: 5)
+                } else {
+                    try service.register()
+                    refreshLaunchAtLoginState()
+                    switch launchAtLoginState {
+                    case .requiresApproval:
+                        setStatusMessage("已请求开启开机自启，请在系统设置的“登录项”中允许它。", autoClearAfter: 6)
+                        PromptCenter.info(
+                            title: "开机自启待系统批准",
+                            message: "我已经请求开启开机自启。请到“系统设置 > 通用 > 登录项”里允许 Codex Account Switcher。"
+                        )
+                    case .enabled:
+                        setStatusMessage("已开启开机自启。", autoClearAfter: 5)
+                    case .disabled, .requiresInstalledCopy, .unavailable:
+                        setStatusMessage("开机自启设置已更新。", autoClearAfter: 5)
+                    }
+                }
+            case .requiresInstalledCopy:
+                setStatusMessage("请先切到安装版，再开启开机自启。", autoClearAfter: 5)
             case .unavailable:
-                statusMessage = "当前构建环境暂不支持开机自启。"
+                setStatusMessage("当前构建环境暂不支持开机自启。", autoClearAfter: 5)
             }
         } catch {
-            statusMessage = "设置开机自启失败：\(error.localizedDescription)"
-            PromptCenter.info(title: "无法设置开机自启", message: error.localizedDescription)
+            do {
+                switch launchAtLoginState {
+                case .enabled, .requiresApproval:
+                    try LoginItemManager.unregister(appURL: currentAppURL)
+                    refreshLaunchAtLoginState()
+                    setStatusMessage("已通过系统登录项关闭开机自启。", autoClearAfter: 5)
+                case .disabled:
+                    try LoginItemManager.register(appURL: currentAppURL)
+                    refreshLaunchAtLoginState()
+                    setStatusMessage("已通过系统登录项开启开机自启。", autoClearAfter: 5)
+                case .requiresInstalledCopy, .unavailable:
+                    throw error
+                }
+            } catch {
+                setStatusMessage("设置开机自启失败：\(error.localizedDescription)")
+                PromptCenter.info(title: "无法设置开机自启", message: error.localizedDescription)
+            }
         }
     }
 
     func checkForUpdates(manual: Bool = true) {
         if updateCheckTask != nil {
             if manual {
-                statusMessage = "正在检查更新，请稍候。"
+                setStatusMessage("正在检查更新，请稍候。", autoClearAfter: 3)
             }
             return
         }
@@ -1167,7 +1461,7 @@ private final class ProfileStore: ObservableObject {
                     latestAvailableVersion = release.displayVersion
                     let current = AppMetadata.shortVersion
                     let message = "发现新版本 \(release.displayVersion)，当前是 \(current)。"
-                    statusMessage = message
+                    setStatusMessage(message, autoClearAfter: 6)
 
                     let notifiedKey = UserDefaults.standard.string(forKey: Self.lastNotifiedReleaseKey)
                     if notifiedKey != release.displayVersion {
@@ -1190,12 +1484,12 @@ private final class ProfileStore: ObservableObject {
                         }
                     }
                 } else if manual {
-                    statusMessage = "当前已经是最新版本 \(AppMetadata.shortVersion)。"
+                    setStatusMessage("当前已经是最新版本 \(AppMetadata.shortVersion)。", autoClearAfter: 5)
                 }
             } catch {
                 if manual {
                     let message = error.localizedDescription
-                    statusMessage = message
+                    setStatusMessage(message)
                     PromptCenter.info(title: "检查更新失败", message: message)
                 }
             }
@@ -1214,6 +1508,54 @@ private final class ProfileStore: ObservableObject {
         runAction(arguments: ["export-backup", path], successTitle: "备份已导出")
     }
 
+    func repair(_ profile: ProfilePayload) {
+        let hint = profile.repairSummary ?? "这个账号的额度信息当前读取失败。"
+
+        if profile.active && profile.needsResaveRepair {
+            let shouldResave = PromptCenter.confirmAction(
+                title: "修复当前账号档案",
+                message: "\(hint)\n\n我会重新保存当前账号到同名档案里。",
+                confirmTitle: "重新保存",
+                cancelTitle: "取消"
+            )
+            guard shouldResave else {
+                return
+            }
+            runAction(
+                arguments: ["save", "--force", profile.profileName],
+                showSuccessAlert: false,
+                successTitle: "档案已修复"
+            )
+            return
+        }
+
+        if profile.active {
+            let shouldOpenCodex = PromptCenter.confirmAction(
+                title: "修复当前账号",
+                message: "\(hint)\n\n我会先打开 Codex。如果出现登录页，请完成登录后回到切换器点“刷新”。",
+                confirmTitle: "打开 Codex",
+                cancelTitle: "取消"
+            )
+            guard shouldOpenCodex else {
+                return
+            }
+            openCodexApp()
+            setStatusMessage("已打开 Codex。完成登录后回到这里点刷新；如果已经登录正常，也可以重新保存当前账号。", autoClearAfter: 8)
+            return
+        }
+
+        let shouldSwitch = PromptCenter.confirmAction(
+            title: "修复账号档案",
+            message: "\(hint)\n\n我会先切换到“\(profile.profileName)”，并重新打开 Codex。如果出现登录页，请完成登录后再回到切换器点刷新。",
+            confirmTitle: "切换并修复",
+            cancelTitle: "取消"
+        )
+        guard shouldSwitch else {
+            return
+        }
+        switchTo(profile)
+    }
+
     private func openURL(_ raw: String) {
         guard let url = URL(string: raw) else {
             return
@@ -1227,6 +1569,11 @@ private final class ProfileStore: ObservableObject {
             return
         }
 
+        guard isRunningInstalledCopy else {
+            launchAtLoginState = .requiresInstalledCopy
+            return
+        }
+
         switch SMAppService.mainApp.status {
         case .enabled:
             launchAtLoginState = .enabled
@@ -1235,7 +1582,7 @@ private final class ProfileStore: ObservableObject {
         case .requiresApproval:
             launchAtLoginState = .requiresApproval
         case .notFound:
-            launchAtLoginState = .unavailable
+            launchAtLoginState = LoginItemManager.isEnabled(for: currentAppURL) ? .enabled : .disabled
         @unknown default:
             launchAtLoginState = .unavailable
         }
@@ -1346,9 +1693,12 @@ private final class ProfileStore: ObservableObject {
                     }
 
                     lastUpdated = Date()
-                    statusMessage = autoSavedMessage.isEmpty
-                        ? "已识别并保存 \(displayName)。继续登录下一个账号也会自动保存。"
-                        : autoSavedMessage
+                    setStatusMessage(
+                        autoSavedMessage.isEmpty
+                            ? "已识别并保存 \(displayName)。继续登录下一个账号也会自动保存。"
+                            : autoSavedMessage,
+                        autoClearAfter: 6
+                    )
                     postNotification(
                         title: "新账号已自动保存",
                         body: "\(displayName) 已加入切换器。你可以继续登录下一个账号。"
@@ -1414,13 +1764,13 @@ private final class ProfileStore: ObservableObject {
             do {
                 let output = try await SwitcherCLI.run(arguments)
                 lastUpdated = Date()
-                statusMessage = output.isEmpty ? "已完成。" : output
+                setStatusMessage(output.isEmpty ? "已完成。" : output, autoClearAfter: 5)
                 refresh(silent: true)
                 if showSuccessAlert {
                     PromptCenter.info(title: successTitle, message: output.isEmpty ? "已完成。" : output)
                 }
             } catch {
-                statusMessage = error.localizedDescription
+                setStatusMessage(error.localizedDescription)
                 PromptCenter.info(title: "操作失败", message: error.localizedDescription)
             }
             isLoading = false
@@ -1663,6 +2013,7 @@ private struct ProfileCard: View {
     let profile: ProfilePayload
     let recommended: Bool
     let onSwitch: () -> Void
+    let onRepair: () -> Void
     let onRename: () -> Void
     let onDelete: () -> Void
 
@@ -1730,6 +2081,15 @@ private struct ProfileCard: View {
                 .controlSize(.mini)
                 .disabled(profile.active)
 
+                if profile.needsRepair {
+                    Button("修复") {
+                        onRepair()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .tint(Color(red: 0.90, green: 0.48, blue: 0.12))
+                }
+
                 Menu {
                     Button("重命名档案", action: onRename)
                     Button("删除档案", role: .destructive, action: onDelete)
@@ -1763,11 +2123,17 @@ private struct ProfileCard: View {
                 .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
             }
 
-            if let error = profile.usage?.error {
-                Text(error)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color(red: 0.82, green: 0.22, blue: 0.22))
-                    .lineLimit(1)
+            if let repairSummary = profile.repairSummary ?? profile.usageError {
+                HStack(spacing: 6) {
+                    Image(systemName: profile.needsResaveRepair ? "square.and.arrow.down.on.square" : "wrench.and.screwdriver.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(repairSummary)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color(red: 0.82, green: 0.22, blue: 0.22))
+                .help(profile.usageError ?? repairSummary)
             }
         }
         .padding(12)
@@ -1825,7 +2191,13 @@ private struct ProfileCard: View {
 
     private func compactQuotaLabel(_ remaining: Int?) -> String {
         guard let remaining else {
-            return "未知"
+            if profile.isAwaitingUsageFetch {
+                return "待刷"
+            }
+            if profile.usageError != nil {
+                return "失败"
+            }
+            return "待刷"
         }
         if remaining <= 0 {
             return "已满"
@@ -2027,15 +2399,27 @@ private struct DashboardView: View {
             )
 
             if let statusMessage = store.statusMessage, !statusMessage.isEmpty {
-                Text(statusMessage)
-                    .font(.system(size: 12, weight: .medium))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(Color(nsColor: .textBackgroundColor))
-                    )
+                HStack(alignment: .center, spacing: 10) {
+                    Text(statusMessage)
+                        .font(.system(size: 12, weight: .medium))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Button {
+                        store.dismissStatusMessage()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color(nsColor: .secondaryLabelColor))
+                    }
+                    .buttonStyle(.plain)
+                    .help("关闭提示")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color(nsColor: .textBackgroundColor))
+                )
             }
 
             HStack(spacing: 10) {
@@ -2186,6 +2570,7 @@ private struct DashboardView: View {
                                     profile: profile,
                                     recommended: store.recommendedProfile?.profileName == profile.profileName,
                                     onSwitch: { store.switchTo(profile) },
+                                    onRepair: { store.repair(profile) },
                                     onRename: { store.rename(profile) },
                                     onDelete: { store.delete(profile) }
                                 )
@@ -2199,6 +2584,7 @@ private struct DashboardView: View {
                                     profile: profile,
                                     recommended: store.recommendedProfile?.profileName == profile.profileName,
                                     onSwitch: { store.switchTo(profile) },
+                                    onRepair: { store.repair(profile) },
                                     onRename: { store.rename(profile) },
                                     onDelete: { store.delete(profile) }
                                 )
