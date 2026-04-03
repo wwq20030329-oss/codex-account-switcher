@@ -1,5 +1,7 @@
 # Codex Account Switcher
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Codex Account Switcher is a native macOS menu bar app for saving local Codex login snapshots and switching between them quickly.
 
 It combines a SwiftUI menu bar frontend with a bundled Python CLI backend, so you can manage multiple local Codex accounts without manually rebuilding your session every time.
