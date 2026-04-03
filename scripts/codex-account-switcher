@@ -1,0 +1,1622 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import concurrent.futures
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+HOME = Path.home()
+CODEX_HOME = HOME / ".codex"
+APP_SUPPORT = HOME / "Library/Application Support/Codex"
+SWITCHER_HOME = HOME / ".codex-account-switcher"
+PROFILES_DIR = SWITCHER_HOME / "profiles"
+STATE_FILE = SWITCHER_HOME / "state.json"
+LOCK_FILE = SWITCHER_HOME / ".lock"
+
+
+@dataclass(frozen=True)
+class SnapshotItem:
+    live_path: Path
+    snapshot_rel: Path
+    required: bool = False
+
+
+SNAPSHOT_ITEMS = (
+    SnapshotItem(CODEX_HOME / "auth.json", Path("codex/auth.json"), required=True),
+    SnapshotItem(APP_SUPPORT / "Cookies", Path("app/Cookies")),
+    SnapshotItem(APP_SUPPORT / "Cookies-journal", Path("app/Cookies-journal")),
+    SnapshotItem(APP_SUPPORT / "Local Storage", Path("app/Local Storage")),
+    SnapshotItem(APP_SUPPORT / "Session Storage", Path("app/Session Storage")),
+)
+
+
+class SwitcherError(RuntimeError):
+    """Raised when the switcher cannot safely continue."""
+
+
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/"
+MAX_USAGE_REFRESH_WORKERS = 4
+USAGE_REQUEST_TIMEOUT_SECONDS = 12
+RECENT_USAGE_CACHE_SECONDS = 90
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def ensure_layout() -> None:
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", delete=False, dir=path.parent, encoding="utf-8"
+    ) as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        temp_name = handle.name
+    os.replace(temp_name, path)
+
+
+def remove_path(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+        return
+    path.unlink()
+
+
+def copy_path(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cloned = subprocess.run(
+        ["cp", "-cR", str(src), str(dst)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cloned.returncode == 0:
+        if dst.is_dir():
+            for lock_path in dst.rglob("LOCK"):
+                remove_path(lock_path)
+        return
+
+    if src.is_dir():
+        shutil.copytree(src, dst, ignore=shutil.ignore_patterns("LOCK"))
+        return
+    shutil.copy2(src, dst)
+
+
+def auth_payload(auth_path: Path | None = None) -> dict[str, Any] | None:
+    auth_path = auth_path or CODEX_HOME / "auth.json"
+    if not auth_path.exists():
+        return None
+    return load_json(auth_path, None)
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def decode_jwt_payload(token: str | None) -> dict[str, Any]:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        raw = base64.urlsafe_b64decode(payload)
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def short_hash(text: str | None) -> str | None:
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def mask_secret(secret: str | None) -> str | None:
+    if not secret:
+        return None
+    if len(secret) <= 8:
+        return secret
+    return f"{secret[:4]}...{secret[-4:]}"
+
+
+def normalize_email(email: str | None) -> str | None:
+    if not isinstance(email, str):
+        return None
+    normalized = email.strip().lower()
+    return normalized or None
+
+
+def current_account_info() -> dict[str, Any] | None:
+    auth = auth_payload()
+    if not auth:
+        return None
+
+    raw_auth = json.dumps(auth, ensure_ascii=False, sort_keys=True)
+    tokens = auth.get("tokens") or {}
+    id_token_payload = decode_jwt_payload(tokens.get("id_token"))
+    api_key = auth.get("OPENAI_API_KEY")
+
+    info = {
+        "auth_mode": auth.get("auth_mode") or "unknown",
+        "account_id": tokens.get("account_id"),
+        "email": id_token_payload.get("email"),
+        "name": id_token_payload.get("name"),
+        "subject": id_token_payload.get("sub"),
+        "last_refresh": auth.get("last_refresh"),
+        "auth_fingerprint": short_hash(raw_auth),
+        "api_key_hint": mask_secret(api_key),
+        "api_key_hash": short_hash(api_key),
+    }
+
+    identity_parts = [info["auth_mode"]]
+    for candidate in (
+        info["subject"],
+        info["email"],
+        info["account_id"],
+        info["api_key_hash"],
+        info["auth_fingerprint"],
+    ):
+        if candidate:
+            identity_parts.append(candidate)
+            break
+    info["identity_key"] = "::".join(identity_parts)
+    return info
+
+
+def codex_credentials(auth_path: Path | None = None) -> dict[str, Any]:
+    auth = auth_payload(auth_path)
+    if not auth:
+        raise SwitcherError("没有检测到 Codex 登录态。")
+
+    api_key = auth.get("OPENAI_API_KEY")
+    if isinstance(api_key, str) and api_key.strip():
+        return {
+            "access_token": api_key.strip(),
+            "refresh_token": "",
+            "id_token": None,
+            "account_id": None,
+            "last_refresh": None,
+            "is_api_key": True,
+        }
+
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict):
+        raise SwitcherError("Codex 登录态缺少 tokens。")
+
+    access_token = tokens.get("access_token") or tokens.get("accessToken")
+    refresh_token = tokens.get("refresh_token") or tokens.get("refreshToken") or ""
+    if not access_token:
+        raise SwitcherError("Codex 登录态缺少 access token。")
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": tokens.get("id_token") or tokens.get("idToken"),
+        "account_id": tokens.get("account_id") or tokens.get("accountId"),
+        "last_refresh": parse_iso_datetime(auth.get("last_refresh")),
+        "is_api_key": False,
+    }
+
+
+def credentials_need_refresh(credentials: dict[str, Any]) -> bool:
+    if credentials.get("is_api_key"):
+        return False
+    last_refresh = credentials.get("last_refresh")
+    if not isinstance(last_refresh, datetime):
+        return True
+    age_seconds = datetime.now(timezone.utc).timestamp() - last_refresh.timestamp()
+    return age_seconds > 8 * 24 * 60 * 60
+
+
+def save_codex_credentials(credentials: dict[str, Any], auth_path: Path | None = None) -> None:
+    auth_path = auth_path or CODEX_HOME / "auth.json"
+    auth = auth_payload(auth_path) or {}
+    tokens = auth.get("tokens") or {}
+    tokens["access_token"] = credentials["access_token"]
+    tokens["refresh_token"] = credentials["refresh_token"]
+    if credentials.get("id_token"):
+        tokens["id_token"] = credentials["id_token"]
+    if credentials.get("account_id"):
+        tokens["account_id"] = credentials["account_id"]
+    auth["tokens"] = tokens
+    auth["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    write_json(auth_path, auth)
+
+
+def refresh_codex_token(credentials: dict[str, Any], auth_path: Path | None = None) -> dict[str, Any]:
+    refresh_token = credentials.get("refresh_token") or ""
+    if not refresh_token:
+        raise SwitcherError("当前账号没有 refresh token，无法自动刷新。请重新登录 Codex。")
+
+    request = urllib.request.Request("https://auth.openai.com/oauth/token", method="POST")
+    request.add_header("Content-Type", "application/json")
+    body = json.dumps(
+        {
+            "client_id": CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email",
+        }
+    ).encode("utf-8")
+    request.data = body
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            body_text = error.read().decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+        raise SwitcherError(f"刷新 Codex 登录态失败（HTTP {error.code}）。{body_text}".strip())
+    except urllib.error.URLError as error:
+        raise SwitcherError(f"刷新 Codex 登录态失败：{error.reason}")
+
+    refreshed = {
+        **credentials,
+        "access_token": payload.get("access_token") or credentials["access_token"],
+        "refresh_token": payload.get("refresh_token") or credentials["refresh_token"],
+        "id_token": payload.get("id_token") or credentials.get("id_token"),
+        "last_refresh": datetime.now(timezone.utc),
+    }
+    save_codex_credentials(refreshed, auth_path=auth_path)
+    return refreshed
+
+
+def resolve_chatgpt_base_url() -> str:
+    config_path = CODEX_HOME / "config.toml"
+    if config_path.exists():
+        for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() != "chatgpt_base_url":
+                continue
+            value = value.strip().strip('"').strip("'").strip()
+            if value:
+                return value
+    return DEFAULT_CHATGPT_BASE_URL
+
+
+def resolve_usage_url() -> str:
+    base_url = resolve_chatgpt_base_url().strip() or DEFAULT_CHATGPT_BASE_URL
+    while base_url.endswith("/"):
+        base_url = base_url[:-1]
+    if (
+        (base_url.startswith("https://chatgpt.com") or base_url.startswith("https://chat.openai.com"))
+        and "/backend-api" not in base_url
+    ):
+        base_url += "/backend-api"
+    suffix = "/wham/usage" if "/backend-api" in base_url else "/api/codex/usage"
+    return base_url + suffix
+
+
+def maybe_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def maybe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def usage_window_payload(window: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(window, dict):
+        return None
+    used_percent = maybe_int(window.get("used_percent"))
+    window_seconds = maybe_int(window.get("limit_window_seconds"))
+    reset_at = maybe_int(window.get("reset_at"))
+    reset_after_seconds = maybe_int(window.get("reset_after_seconds"))
+    payload = {
+        "used_percent": used_percent,
+        "remaining_percent": None if used_percent is None else max(0, 100 - used_percent),
+        "window_seconds": window_seconds,
+        "window_minutes": None if window_seconds is None else window_seconds // 60,
+        "reset_at": None
+        if reset_at is None
+        else datetime.fromtimestamp(reset_at, tz=timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "reset_after_seconds": reset_after_seconds,
+    }
+    return payload
+
+
+def plan_display_name(plan_type: str | None) -> str:
+    if not plan_type:
+        return "未知"
+    names = {
+        "guest": "Guest",
+        "free": "Free",
+        "go": "Go",
+        "plus": "Plus",
+        "pro": "Pro",
+        "free_workspace": "Free Workspace",
+        "team": "Team",
+        "business": "Business",
+        "education": "Education",
+        "enterprise": "Enterprise",
+        "edu": "Edu",
+    }
+    return names.get(plan_type, plan_type)
+
+
+def fetch_codex_usage_payload(auth_path: Path | None = None) -> dict[str, Any]:
+    credentials = codex_credentials(auth_path=auth_path)
+    if credentials_need_refresh(credentials):
+        credentials = refresh_codex_token(credentials, auth_path=auth_path)
+
+    def request_usage(access_token: str, account_id: str | None) -> dict[str, Any]:
+        request = urllib.request.Request(resolve_usage_url(), method="GET")
+        request.add_header("Authorization", f"Bearer {access_token}")
+        request.add_header("Accept", "application/json")
+        request.add_header("User-Agent", "CodexAccountSwitcher")
+        if account_id:
+            request.add_header("ChatGPT-Account-Id", account_id)
+
+        with urllib.request.urlopen(request, timeout=USAGE_REQUEST_TIMEOUT_SECONDS) as response:
+            return json.load(response)
+
+    try:
+        raw = request_usage(credentials["access_token"], credentials.get("account_id"))
+    except urllib.error.HTTPError as error:
+        if error.code in {401, 403} and credentials.get("refresh_token"):
+            credentials = refresh_codex_token(credentials, auth_path=auth_path)
+            try:
+                raw = request_usage(credentials["access_token"], credentials.get("account_id"))
+            except urllib.error.HTTPError as second_error:
+                body = second_error.read().decode("utf-8", errors="replace")
+                raise SwitcherError(
+                    f"读取 Codex 用量失败（HTTP {second_error.code}）。请重新登录 Codex。{body}".strip()
+                )
+        else:
+            body = error.read().decode("utf-8", errors="replace")
+            raise SwitcherError(f"读取 Codex 用量失败（HTTP {error.code}）。{body}".strip())
+    except urllib.error.URLError as error:
+        raise SwitcherError(f"读取 Codex 用量失败：{error.reason}")
+
+    id_token_payload = decode_jwt_payload(credentials.get("id_token"))
+    email = raw.get("email") or id_token_payload.get("email")
+    plan_type = raw.get("plan_type") or id_token_payload.get("chatgpt_plan_type")
+    credits = raw.get("credits") if isinstance(raw.get("credits"), dict) else {}
+    rate_limit = raw.get("rate_limit") if isinstance(raw.get("rate_limit"), dict) else {}
+
+    return {
+        "email": email,
+        "account_id": raw.get("account_id") or credentials.get("account_id"),
+        "plan_type": plan_type,
+        "plan_display": plan_display_name(plan_type),
+        "allowed": rate_limit.get("allowed"),
+        "limit_reached": rate_limit.get("limit_reached"),
+        "primary_window": usage_window_payload(rate_limit.get("primary_window")),
+        "secondary_window": usage_window_payload(rate_limit.get("secondary_window")),
+        "credits": {
+            "has_credits": bool(credits.get("has_credits")),
+            "unlimited": bool(credits.get("unlimited")),
+            "balance": maybe_float(credits.get("balance")),
+            "approx_local_messages": maybe_int(credits.get("approx_local_messages")),
+            "approx_cloud_messages": maybe_int(credits.get("approx_cloud_messages")),
+        },
+        "checked_at": now_iso(),
+        "usage_url": "https://chatgpt.com/codex/settings/usage",
+        "billing_url": "https://platform.openai.com/settings/organization/billing/overview",
+        "source": "codex-api-key" if credentials.get("is_api_key") else "codex-oauth-api",
+    }
+
+
+def format_window_summary(label: str, window: dict[str, Any] | None) -> str:
+    if not window:
+        return f"{label}: 暂无"
+    percent = window.get("used_percent")
+    remaining = window.get("remaining_percent")
+    window_minutes = window.get("window_minutes")
+    reset_at = window.get("reset_at")
+    pieces = [f"{label}: 已用 {percent}%"]
+    if remaining is not None:
+        pieces.append(f"剩余 {remaining}%")
+    if window_minutes is not None:
+        pieces.append(f"窗口 {window_minutes} 分钟")
+    if reset_at:
+        pieces.append(f"重置 {reset_at}")
+    return "，".join(pieces)
+
+
+def sanitize_name(name: str) -> str:
+    cleaned = name.strip()
+    if not cleaned:
+        raise SwitcherError("档案名不能为空。")
+    if "/" in cleaned:
+        raise SwitcherError("档案名不能包含 / 。")
+    if cleaned in {".", ".."}:
+        raise SwitcherError("档案名不能是 . 或 .. 。")
+    return cleaned
+
+
+def default_profile_name(info: dict[str, Any], existing_names: set[str]) -> str:
+    candidates = [
+        info.get("email"),
+        info.get("name"),
+        info.get("account_id"),
+        "codex-account",
+    ]
+    base = next((item for item in candidates if item), "codex-account")
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in base)
+    safe = safe.strip("-_.") or "codex-account"
+
+    candidate = safe
+    index = 2
+    while candidate in existing_names:
+        candidate = f"{safe}-{index}"
+        index += 1
+    return candidate
+
+
+def profile_dir(name: str) -> Path:
+    return PROFILES_DIR / sanitize_name(name)
+
+
+def profile_metadata_path(name: str) -> Path:
+    return profile_dir(name) / "profile.json"
+
+
+def profile_auth_path(name: str) -> Path:
+    return profile_dir(name) / "codex" / "auth.json"
+
+
+def profile_usage_cache_path(name: str) -> Path:
+    return profile_dir(name) / "usage.json"
+
+
+def read_profile(name: str) -> dict[str, Any]:
+    metadata_path = profile_metadata_path(name)
+    if not metadata_path.exists():
+        raise SwitcherError(f"找不到档案：{name}")
+    return load_json(metadata_path, {})
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    ensure_layout()
+    profiles: list[dict[str, Any]] = []
+    for entry in sorted(PROFILES_DIR.iterdir(), key=lambda item: item.name.lower()):
+        if not entry.is_dir():
+            continue
+        metadata_path = entry / "profile.json"
+        if not metadata_path.exists():
+            continue
+        metadata = load_json(metadata_path, {})
+        metadata["profile_name"] = entry.name
+        profiles.append(metadata)
+    return profiles
+
+
+def load_state() -> dict[str, Any]:
+    return load_json(STATE_FILE, {})
+
+
+def save_state(state: dict[str, Any]) -> None:
+    write_json(STATE_FILE, state)
+
+
+def metadata_matches_account(metadata: dict[str, Any], info: dict[str, Any] | None) -> bool:
+    if not metadata or not info:
+        return False
+
+    metadata_mode = metadata.get("auth_mode")
+    info_mode = info.get("auth_mode")
+    if metadata_mode and info_mode and metadata_mode != info_mode:
+        return False
+
+    metadata_api_key_hash = metadata.get("api_key_hash")
+    info_api_key_hash = info.get("api_key_hash")
+    if metadata_api_key_hash or info_api_key_hash:
+        return bool(
+            metadata_api_key_hash
+            and info_api_key_hash
+            and metadata_api_key_hash == info_api_key_hash
+        )
+
+    metadata_subject = metadata.get("subject")
+    info_subject = info.get("subject")
+    if metadata_subject and info_subject:
+        return metadata_subject == info_subject
+
+    metadata_email = normalize_email(metadata.get("email"))
+    info_email = normalize_email(info.get("email"))
+    if metadata_email and info_email:
+        return metadata_email == info_email
+
+    metadata_identity = metadata.get("identity_key")
+    if metadata_identity and metadata_identity == info.get("identity_key"):
+        return True
+
+    metadata_account_id = metadata.get("account_id")
+    info_account_id = info.get("account_id")
+    if metadata_account_id and info_account_id:
+        return metadata_account_id == info_account_id
+
+    metadata_fingerprint = metadata.get("auth_fingerprint")
+    info_fingerprint = info.get("auth_fingerprint")
+    if metadata_fingerprint and info_fingerprint:
+        return metadata_fingerprint == info_fingerprint
+
+    return False
+
+
+def find_matching_profile_name(
+    info: dict[str, Any] | None, profiles: list[dict[str, Any]], state: dict[str, Any]
+) -> str | None:
+    if not info:
+        return None
+
+    matches = [profile["profile_name"] for profile in profiles if metadata_matches_account(profile, info)]
+    if len(matches) == 1:
+        return matches[0]
+
+    active_profile = state.get("active_profile")
+    if active_profile:
+        active_metadata = next(
+            (profile for profile in profiles if profile["profile_name"] == active_profile), None
+        )
+        if active_metadata and metadata_matches_account(active_metadata, info):
+            return active_profile
+
+    return None
+
+
+def format_profile_line(profile: dict[str, Any], active_name: str | None) -> str:
+    marker = "*" if profile["profile_name"] == active_name else " "
+    account = profile.get("email") or profile.get("name") or profile.get("account_id") or "未知账号"
+    saved_at = profile.get("updated_at") or profile.get("created_at") or "未知时间"
+    mode = profile.get("auth_mode") or "unknown"
+    usage_summary = profile.get("usage_summary")
+    if usage_summary:
+        return f"{marker} {profile['profile_name']:<24} {account:<40} {mode:<12} {saved_at} | {usage_summary}"
+    return f"{marker} {profile['profile_name']:<24} {account:<40} {mode:<12} {saved_at}"
+
+
+def credits_summary_text(credits: dict[str, Any] | None) -> str:
+    credits = credits or {}
+    if credits.get("unlimited"):
+        return "Credits unlimited"
+    if credits.get("has_credits"):
+        balance = credits.get("balance")
+        if balance is not None:
+            return f"Credits {balance:g}"
+        return "Credits 可用"
+    return "无 credits"
+
+
+def usage_summary_text(usage: dict[str, Any] | None) -> str:
+    if not isinstance(usage, dict):
+        return "额度未知"
+
+    plan = usage.get("plan_display") or usage.get("plan_type") or "未知套餐"
+    primary_window = usage.get("primary_window")
+    primary_remaining = None if not isinstance(primary_window, dict) else primary_window.get("remaining_percent")
+    secondary_window = usage.get("secondary_window")
+    secondary_remaining = None if not isinstance(secondary_window, dict) else secondary_window.get("remaining_percent")
+    if (
+        usage.get("error")
+        and plan == "未知套餐"
+        and primary_remaining is None
+        and secondary_remaining is None
+    ):
+        return "额度读取失败"
+
+    parts = [plan]
+    if primary_remaining is None:
+        parts.append("5h未知")
+    elif primary_remaining <= 0:
+        parts.append("5h已满")
+    else:
+        parts.append(f"5h剩 {primary_remaining}%")
+
+    if secondary_remaining is None:
+        parts.append("周未知")
+    elif secondary_remaining <= 0:
+        parts.append("周已满")
+    else:
+        parts.append(f"周剩 {secondary_remaining}%")
+
+    credits = usage.get("credits") if isinstance(usage.get("credits"), dict) else {}
+    if credits.get("unlimited") or credits.get("has_credits"):
+        parts.append(credits_summary_text(credits))
+
+    if usage.get("stale"):
+        parts.append("缓存")
+    if usage.get("error") and len(parts) == 1:
+        parts.append("额度读取失败")
+    return " | ".join(parts)
+
+
+def empty_usage_payload(profile: dict[str, Any], error: str) -> dict[str, Any]:
+    return {
+        "email": profile.get("email"),
+        "account_id": profile.get("account_id"),
+        "plan_type": None,
+        "plan_display": None,
+        "allowed": None,
+        "limit_reached": None,
+        "primary_window": None,
+        "secondary_window": None,
+        "credits": {
+            "has_credits": False,
+            "unlimited": False,
+            "balance": None,
+            "approx_local_messages": None,
+            "approx_cloud_messages": None,
+        },
+        "checked_at": now_iso(),
+        "usage_url": "https://chatgpt.com/codex/settings/usage",
+        "billing_url": "https://platform.openai.com/settings/organization/billing/overview",
+        "source": "profile-snapshot",
+        "error": error,
+        "cached": False,
+        "stale": False,
+    }
+
+
+def cached_profile_usage(name: str) -> dict[str, Any] | None:
+    cached = load_json(profile_usage_cache_path(name), None)
+    if not isinstance(cached, dict):
+        return None
+    return cached
+
+
+def usage_cache_is_recent(cached: dict[str, Any] | None, max_age_seconds: int) -> bool:
+    if not isinstance(cached, dict):
+        return False
+    checked_at = parse_iso_datetime(cached.get("checked_at"))
+    if not checked_at:
+        return False
+    if cached.get("error"):
+        return False
+    age_seconds = datetime.now(timezone.utc).timestamp() - checked_at.astimezone(timezone.utc).timestamp()
+    return age_seconds <= max_age_seconds
+
+
+def snapshot_profile_usage(profile: dict[str, Any]) -> dict[str, Any]:
+    usage = empty_usage_payload(profile, "")
+    usage["error"] = None
+    usage["checked_at"] = None
+    usage["cached"] = True
+    usage["stale"] = True
+    usage["source"] = "profile-cache"
+    return usage
+
+
+def fetch_profile_usage(profile: dict[str, Any], *, max_age_seconds: int | None = None) -> dict[str, Any]:
+    profile_name = profile["profile_name"]
+    auth_path = profile_auth_path(profile_name)
+    if not auth_path.exists():
+        return empty_usage_payload(profile, f"档案缺少登录快照：{auth_path}")
+
+    cached = cached_profile_usage(profile_name)
+    if max_age_seconds and usage_cache_is_recent(cached, max_age_seconds):
+        return {
+            **cached,
+            "cached": True,
+            "stale": False,
+        }
+
+    try:
+        usage = {
+            **fetch_codex_usage_payload(auth_path=auth_path),
+            "error": None,
+            "cached": False,
+            "stale": False,
+        }
+        write_json(profile_usage_cache_path(profile_name), usage)
+        return usage
+    except SwitcherError as error:
+        if cached:
+            return {
+                **cached,
+                "error": str(error),
+                "cached": True,
+                "stale": True,
+            }
+        return empty_usage_payload(profile, str(error))
+
+
+def enrich_profiles_with_usage(
+    profiles: list[dict[str, Any]], *, max_age_seconds: int | None = RECENT_USAGE_CACHE_SECONDS
+) -> list[dict[str, Any]]:
+    if len(profiles) <= 1:
+        enriched: list[dict[str, Any]] = []
+        for profile in profiles:
+            usage = fetch_profile_usage(profile, max_age_seconds=max_age_seconds)
+            enriched.append(
+                {
+                    **profile,
+                    "usage": usage,
+                    "usage_summary": usage_summary_text(usage),
+                }
+            )
+        return enriched
+
+    results: list[dict[str, Any] | None] = [None] * len(profiles)
+    max_workers = min(MAX_USAGE_REFRESH_WORKERS, len(profiles))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(fetch_profile_usage, profile, max_age_seconds=max_age_seconds): index
+            for index, profile in enumerate(profiles)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            index = future_to_index[future]
+            profile = profiles[index]
+            try:
+                usage = future.result()
+            except Exception as error:
+                usage = empty_usage_payload(profile, str(error))
+            results[index] = {
+                **profile,
+                "usage": usage,
+                "usage_summary": usage_summary_text(usage),
+            }
+
+    return [item for item in results if item is not None]
+
+
+def enrich_profiles_with_cached_usage(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for profile in profiles:
+        cached = cached_profile_usage(profile["profile_name"])
+        usage = (
+            {
+                **cached,
+                "cached": True,
+                "stale": True,
+            }
+            if cached
+            else snapshot_profile_usage(profile)
+        )
+        enriched.append(
+            {
+                **profile,
+                "usage": usage,
+                "usage_summary": usage_summary_text(usage),
+            }
+        )
+    return enriched
+
+
+def print_json(payload: Any) -> int:
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+def show_alert(message: str) -> None:
+    subprocess.run(
+        [
+            "osascript",
+            "-e",
+            'tell application "System Events" to activate',
+            "-e",
+            f'display alert "Codex 账号切换器" message {json.dumps(message)} as informational',
+        ],
+        check=False,
+    )
+
+
+def show_profiles_usage_alert(profiles: list[dict[str, Any]]) -> None:
+    if not profiles:
+        show_alert("还没有任何已保存档案，暂时看不到各账号额度。")
+        return
+
+    lines = []
+    for profile in profiles:
+        marker = "当前" if profile.get("active") else "已保存"
+        line = f"{marker} {profile['profile_name']} | {profile.get('usage_summary') or '额度未知'}"
+        usage = profile.get("usage") if isinstance(profile.get("usage"), dict) else {}
+        if usage.get("error") and usage.get("stale"):
+            line += " | 网络失败，显示缓存"
+        elif usage.get("error"):
+            line += " | 读取失败"
+        lines.append(line)
+    show_alert("\n".join(lines))
+
+
+def open_url(url: str) -> None:
+    subprocess.run(["open", url], check=False)
+
+
+def open_plan_and_usage_pages() -> None:
+    open_url("https://chatgpt.com/codex/settings/usage")
+    open_url("https://platform.openai.com/usage")
+    open_url("https://platform.openai.com/settings/organization/billing/overview")
+    show_alert(
+        "已打开官方页面：\\n"
+        "1. Codex 用量页\\n"
+        "2. API Usage：查看 API 用量\\n"
+        "3. API Billing Overview：查看 API 账单与余额"
+    )
+
+
+def prompt_for_profile_name(default_name: str, message: str = "给这个 Codex 账号起个名字：") -> str | None:
+    script = """
+    on run argv
+      tell application "System Events" to activate
+      set defaultName to item 1 of argv
+      set promptMessage to item 2 of argv
+      set dialogResult to display dialog promptMessage default answer defaultName buttons {"取消", "保存"} default button "保存"
+      return text returned of dialogResult
+    end run
+    """
+    result = subprocess.run(
+        ["osascript", "-e", script, default_name, message],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    profile_name = result.stdout.strip()
+    if not profile_name:
+        return None
+    return profile_name
+
+
+def choose_unmanaged_account_action() -> str | None:
+    script = """
+    tell application "System Events" to activate
+    set chosenButton to button returned of (display dialog "当前这个 Codex 账号还没有保存成档案。切换前要怎么处理？" buttons {"取消", "直接切换", "先保存再切换"} default button "先保存再切换")
+    return chosenButton
+    """
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    action = result.stdout.strip()
+    if not action:
+        return None
+    return action
+
+
+def choose_main_action(
+    info: dict[str, Any] | None, profiles: list[dict[str, Any]], managed_name: str | None
+) -> str | None:
+    account = "未检测到当前 Codex 登录态"
+    if info:
+        account = info.get("email") or info.get("name") or info.get("account_id") or account
+
+    managed = managed_name or "未保存"
+    message = (
+        f"当前账号: {account}\n"
+        f"当前档案: {managed}\n"
+        f"已保存账号数: {len(profiles)}\n\n"
+        "请选择要执行的操作。"
+    )
+    script = """
+    on run argv
+      tell application "System Events" to activate
+      set promptMessage to item 1 of argv
+      set actionItems to {"保存当前账号", "切换其它账号", "重命名档案", "查看套餐/额度"}
+      set selected to choose from list actionItems with prompt promptMessage OK button name "继续" cancel button name "取消" without multiple selections allowed
+      if selected is false then
+        return ""
+      end if
+      return item 1 of selected
+    end run
+    """
+    result = subprocess.run(
+        ["osascript", "-e", script, message],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    action = result.stdout.strip()
+    if not action:
+        return None
+    return action
+
+
+def print_current_account() -> int:
+    info = current_account_info()
+    profiles = list_profiles()
+    state = load_state()
+    managed_name = find_matching_profile_name(info, profiles, state)
+
+    if not info:
+        print("当前没有检测到 Codex 登录态。")
+        return 0
+
+    print("当前 Codex 账号")
+    print(f"  名称: {info.get('name') or '未知'}")
+    print(f"  邮箱: {info.get('email') or '未知'}")
+    print(f"  account_id: {info.get('account_id') or '未知'}")
+    print(f"  登录方式: {info.get('auth_mode') or '未知'}")
+    if info.get("last_refresh"):
+        print(f"  最近刷新: {info['last_refresh']}")
+    print(f"  已纳入管理: {managed_name or '否'}")
+    return 0
+
+
+def print_current_account_json() -> int:
+    info = current_account_info()
+    profiles = list_profiles()
+    state = load_state()
+    managed_name = find_matching_profile_name(info, profiles, state)
+    payload = {
+        "current": info,
+        "managed_name": managed_name,
+        "managed": bool(managed_name),
+    }
+    return print_json(payload)
+
+
+def print_profiles() -> int:
+    profiles = list_profiles()
+    state = load_state()
+    active_name = find_matching_profile_name(current_account_info(), profiles, state)
+
+    if not profiles:
+        print("还没有保存任何 Codex 账号档案。")
+        print("先登录一个账号，然后运行: codex-account-switcher save 你的名称")
+        return 0
+
+    profiles = enrich_profiles_with_usage(profiles)
+    print(f"已保存 {len(profiles)} 个 Codex 账号档案")
+    print("  档案名                     账号                                     登录方式      最近保存 | 套餐/额度")
+    for profile in profiles:
+        print(format_profile_line(profile, active_name))
+    return 0
+
+
+def print_profiles_json() -> int:
+    profiles = list_profiles()
+    state = load_state()
+    active_name = find_matching_profile_name(current_account_info(), profiles, state)
+    payload = []
+    for profile in profiles:
+        payload.append(
+            {
+                **profile,
+                "active": profile["profile_name"] == active_name,
+            }
+        )
+    return print_json(payload)
+
+
+def print_profiles_usage_json() -> int:
+    profiles = list_profiles()
+    state = load_state()
+    active_name = find_matching_profile_name(current_account_info(), profiles, state)
+    payload = []
+    for profile in enrich_profiles_with_usage(profiles):
+        payload.append(
+            {
+                **profile,
+                "active": profile["profile_name"] == active_name,
+            }
+        )
+    return print_json(payload)
+
+
+def print_profiles_usage_cached_json() -> int:
+    profiles = list_profiles()
+    state = load_state()
+    active_name = find_matching_profile_name(current_account_info(), profiles, state)
+    payload = []
+    for profile in enrich_profiles_with_cached_usage(profiles):
+        payload.append(
+            {
+                **profile,
+                "active": profile["profile_name"] == active_name,
+            }
+        )
+    return print_json(payload)
+
+
+def print_current_profile_usage_json() -> int:
+    profiles = list_profiles()
+    state = load_state()
+    info = current_account_info()
+    active_name = find_matching_profile_name(info, profiles, state)
+    if not active_name:
+        return print_json(None)
+
+    profile = next((item for item in profiles if item["profile_name"] == active_name), None)
+    if not profile:
+        return print_json(None)
+
+    usage = fetch_profile_usage(profile)
+    return print_json(
+        {
+            **profile,
+            "active": True,
+            "usage": usage,
+            "usage_summary": usage_summary_text(usage),
+        }
+    )
+
+
+def print_usage() -> int:
+    payload = fetch_codex_usage_payload()
+    print("当前 Codex 用量")
+    print(f"  邮箱: {payload.get('email') or '未知'}")
+    print(f"  套餐: {payload.get('plan_display') or '未知'}")
+    print(f"  来源: {payload.get('source')}")
+    print(f"  {format_window_summary('5 小时窗口', payload.get('primary_window'))}")
+    print(f"  {format_window_summary('每周窗口', payload.get('secondary_window'))}")
+    credits = payload.get("credits") or {}
+    if credits.get("unlimited"):
+        print("  Credits: unlimited")
+    elif credits.get("has_credits"):
+        print(f"  Credits: {credits.get('balance')}")
+    else:
+        print("  Credits: 无额外 credits")
+    return 0
+
+
+def print_usage_json() -> int:
+    return print_json(fetch_codex_usage_payload())
+
+
+def is_codex_running() -> bool:
+    result = subprocess.run(
+        ["osascript", "-e", 'application "Codex" is running'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip().lower() == "true"
+
+
+def quit_codex_if_needed() -> bool:
+    was_running = is_codex_running()
+    if not was_running:
+        return False
+
+    subprocess.run(["osascript", "-e", 'tell application "Codex" to quit'], check=False)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if not is_codex_running():
+            return True
+        time.sleep(0.5)
+
+    subprocess.run(["pkill", "-x", "Codex"], check=False)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not is_codex_running():
+            return True
+        time.sleep(0.5)
+
+    raise SwitcherError("没能自动关闭 Codex，请先手动退出后再重试。")
+
+
+def reopen_codex() -> None:
+    subprocess.run(["open", "-a", "Codex"], check=False)
+
+
+def snapshot_current_profile(name: str, *, force: bool = False) -> dict[str, Any]:
+    info = current_account_info()
+    if not info:
+        raise SwitcherError("没有检测到当前登录态，无法保存。")
+
+    target_dir = profile_dir(name)
+    existing = load_json(target_dir / "profile.json", {})
+    if existing and not force and not metadata_matches_account(existing, info):
+        raise SwitcherError(
+            f"档案 {name} 已绑定到另一个账号。若要强制覆盖，请重试并加上 --force。"
+        )
+
+    created_at = existing.get("created_at") or now_iso()
+    temp_root = Path(tempfile.mkdtemp(prefix="profile-", dir=SWITCHER_HOME))
+    try:
+        snapshot_root = temp_root / sanitize_name(name)
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+
+        for item in SNAPSHOT_ITEMS:
+            if not item.live_path.exists():
+                if item.required:
+                    raise SwitcherError(f"缺少必要文件：{item.live_path}")
+                continue
+            copy_path(item.live_path, snapshot_root / item.snapshot_rel)
+
+        metadata = {
+            "profile_name": sanitize_name(name),
+            "created_at": created_at,
+            "updated_at": now_iso(),
+            **info,
+        }
+        write_json(snapshot_root / "profile.json", metadata)
+
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        os.replace(snapshot_root, target_dir)
+        return metadata
+    finally:
+        if temp_root.exists():
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def restore_profile(name: str) -> dict[str, Any]:
+    metadata = read_profile(name)
+    source_root = profile_dir(name)
+
+    for item in SNAPSHOT_ITEMS:
+        live_path = item.live_path
+        snapshot_path = source_root / item.snapshot_rel
+        remove_path(live_path)
+        if snapshot_path.exists():
+            copy_path(snapshot_path, live_path)
+
+    return metadata
+
+
+def auto_save_current_account_if_needed() -> dict[str, Any] | None:
+    profiles = list_profiles()
+    state = load_state()
+    info = current_account_info()
+    if not info:
+        return None
+
+    matched_name = find_matching_profile_name(info, profiles, state)
+    if matched_name:
+        if state.get("active_profile") != matched_name:
+            state["active_profile"] = matched_name
+            save_state(state)
+        return None
+
+    existing_names = {profile["profile_name"] for profile in profiles}
+    target_name = default_profile_name(info, existing_names)
+    metadata = snapshot_current_profile(target_name, force=False)
+
+    state["active_profile"] = target_name
+    state["last_auto_saved_at"] = now_iso()
+    state["last_auto_saved_profile"] = target_name
+    save_state(state)
+    return metadata
+
+
+def save_command(name: str | None, force: bool) -> int:
+    profiles = list_profiles()
+    state = load_state()
+    info = current_account_info()
+    if not info:
+        raise SwitcherError("当前没有登录 Codex，无法保存账号档案。")
+
+    existing_names = {profile["profile_name"] for profile in profiles}
+    matched_name = find_matching_profile_name(info, profiles, state)
+    target_name = sanitize_name(name) if name else matched_name or default_profile_name(
+        info, existing_names
+    )
+
+    was_running = quit_codex_if_needed()
+    metadata = snapshot_current_profile(target_name, force=force)
+
+    state["active_profile"] = target_name
+    state["last_saved_at"] = now_iso()
+    save_state(state)
+
+    if was_running:
+        reopen_codex()
+
+    account = metadata.get("email") or metadata.get("name") or metadata.get("account_id") or "未知账号"
+    print(f"已保存档案 {target_name} -> {account}")
+    return 0
+
+
+def ensure_current_saved_command() -> int:
+    metadata = auto_save_current_account_if_needed()
+    if not metadata:
+        return 0
+    account = metadata.get("email") or metadata.get("name") or metadata.get("account_id") or "未知账号"
+    print(f"已自动保存新账号档案 {metadata['profile_name']} -> {account}")
+    return 0
+
+
+def switch_command(name: str) -> int:
+    target_name = sanitize_name(name)
+    read_profile(target_name)
+
+    profiles = list_profiles()
+    state = load_state()
+    info = current_account_info()
+    current_profile_name = find_matching_profile_name(info, profiles, state)
+
+    if current_profile_name == target_name:
+        print(f"当前已经是档案 {target_name}。")
+        if not is_codex_running():
+            reopen_codex()
+        return 0
+
+    save_before_switch_name: str | None = None
+    if info and current_profile_name is None:
+        action = choose_unmanaged_account_action()
+        if action in {None, "取消"}:
+            return 0
+        if action == "先保存再切换":
+            default_name = (
+                info.get("email")
+                or info.get("name")
+                or info.get("account_id")
+                or "当前账号"
+            )
+            profile_name = prompt_for_profile_name(default_name)
+            if not profile_name:
+                return 0
+            save_before_switch_name = sanitize_name(profile_name)
+        elif action != "直接切换":
+            return 0
+
+    was_running = quit_codex_if_needed()
+
+    if save_before_switch_name:
+        snapshot_current_profile(save_before_switch_name, force=False)
+    elif current_profile_name:
+        snapshot_current_profile(current_profile_name, force=False)
+
+    restored = restore_profile(target_name)
+
+    state["active_profile"] = target_name
+    if save_before_switch_name:
+        state["last_saved_profile"] = save_before_switch_name
+    state["last_switched_at"] = now_iso()
+    save_state(state)
+
+    reopen_codex()
+    account = restored.get("email") or restored.get("name") or restored.get("account_id") or "未知账号"
+    suffix = "，Codex 已重新打开。" if was_running else "，你现在可以直接使用。"
+    print(f"已切换到档案 {target_name} -> {account}{suffix}")
+    return 0
+
+
+def delete_command(name: str) -> int:
+    target_name = sanitize_name(name)
+    target_dir = profile_dir(target_name)
+    if not target_dir.exists():
+        raise SwitcherError(f"找不到档案：{target_name}")
+
+    shutil.rmtree(target_dir)
+    state = load_state()
+    if state.get("active_profile") == target_name:
+        state.pop("active_profile", None)
+        save_state(state)
+
+    print(f"已删除档案 {target_name}")
+    return 0
+
+
+def rename_command(old_name: str, new_name: str) -> int:
+    source_name = sanitize_name(old_name)
+    target_name = sanitize_name(new_name)
+    if source_name == target_name:
+        print(f"档案名未变化：{source_name}")
+        return 0
+
+    source_dir = profile_dir(source_name)
+    target_dir = profile_dir(target_name)
+    if not source_dir.exists():
+        raise SwitcherError(f"找不到档案：{source_name}")
+    if target_dir.exists():
+        raise SwitcherError(f"档案名已存在：{target_name}")
+
+    metadata = read_profile(source_name)
+    metadata["profile_name"] = target_name
+    metadata["updated_at"] = now_iso()
+    write_json(source_dir / "profile.json", metadata)
+    os.replace(source_dir, target_dir)
+
+    state = load_state()
+    if state.get("active_profile") == source_name:
+        state["active_profile"] = target_name
+    if state.get("last_saved_profile") == source_name:
+        state["last_saved_profile"] = target_name
+    save_state(state)
+
+    account = metadata.get("email") or metadata.get("name") or metadata.get("account_id") or "未知账号"
+    print(f"已重命名档案 {source_name} -> {target_name} ({account})")
+    return 0
+
+
+def choose_profile_via_gui(profiles: list[dict[str, Any]], active_name: str | None) -> str | None:
+    if not profiles:
+        show_alert("还没有任何已保存档案。先点“保存当前账号”，再来切换。")
+        return None
+
+    profiles_with_usage = (
+        profiles
+        if profiles and all("usage_summary" in profile for profile in profiles)
+        else enrich_profiles_with_usage(profiles)
+    )
+    labels = []
+    mapping: dict[str, str] = {}
+    for profile in profiles_with_usage:
+        account = profile.get("email") or profile.get("name") or profile.get("account_id") or "未知账号"
+        marker = "当前" if profile["profile_name"] == active_name else "可切换"
+        usage_summary = profile.get("usage_summary") or "额度未知"
+        label = f"{profile['profile_name']} | {account} | {marker} | {usage_summary}"
+        labels.append(label)
+        mapping[label] = profile["profile_name"]
+
+    script = """
+    on run argv
+      tell application "System Events" to activate
+      set selected to choose from list argv with prompt "选择要切换的 Codex 账号" OK button name "切换" cancel button name "取消" without multiple selections allowed
+      if selected is false then
+        return ""
+      end if
+      return item 1 of selected
+    end run
+    """
+    result = subprocess.run(
+        ["osascript", "-e", script, *labels],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    selected = result.stdout.strip()
+    if not selected:
+        return None
+    return mapping.get(selected)
+
+
+def save_current_account_via_gui() -> int:
+    info = current_account_info()
+    if not info:
+        show_alert("当前没有检测到 Codex 登录态，无法保存。请先登录一个账号。")
+        return 0
+
+    profiles = list_profiles()
+    state = load_state()
+    matched_name = find_matching_profile_name(info, profiles, state)
+    default_name = (
+        matched_name
+        or info.get("email")
+        or info.get("name")
+        or info.get("account_id")
+        or "当前账号"
+    )
+    message = "给当前登录的 Codex 账号起个名字。若之前已保存同一账号，会自动更新对应档案。"
+    profile_name = prompt_for_profile_name(default_name, message)
+    if not profile_name:
+        return 0
+    return save_command(profile_name, force=False)
+
+
+def rename_profile_via_gui(profiles: list[dict[str, Any]], active_name: str | None) -> int:
+    selected_name = choose_profile_via_gui(profiles, active_name)
+    if not selected_name:
+        return 0
+
+    metadata = read_profile(selected_name)
+    default_name = metadata.get("profile_name") or selected_name
+    account = metadata.get("email") or metadata.get("name") or metadata.get("account_id") or "这个账号"
+    message = f"给档案“{selected_name}”改个新名字。\\n对应账号：{account}"
+    target_name = prompt_for_profile_name(default_name, message)
+    if not target_name:
+        return 0
+    return rename_command(selected_name, target_name)
+
+
+def menu_command() -> int:
+    auto_save_current_account_if_needed()
+    info = current_account_info()
+    profiles = list_profiles()
+    state = load_state()
+    active_name = find_matching_profile_name(info, profiles, state)
+    action = choose_main_action(info, profiles, active_name)
+    if not action or action == "取消":
+        return 0
+    if action == "保存当前账号":
+        return save_current_account_via_gui()
+    if action == "重命名档案":
+        return rename_profile_via_gui(profiles, active_name)
+    if action == "查看套餐/额度":
+        enriched_profiles = []
+        for profile in enrich_profiles_with_usage(profiles):
+            enriched_profiles.append(
+                {
+                    **profile,
+                    "active": profile["profile_name"] == active_name,
+                }
+            )
+        show_profiles_usage_alert(enriched_profiles)
+        return 0
+    if action == "切换其它账号":
+        selected_name = choose_profile_via_gui(profiles, active_name)
+        if not selected_name:
+            return 0
+        return switch_command(selected_name)
+    return 0
+
+
+def doctor_command() -> int:
+    print("Codex 账号切换器环境检查")
+    for item in SNAPSHOT_ITEMS:
+        status = "存在" if item.live_path.exists() else "缺失"
+        required = "必需" if item.required else "可选"
+        print(f"  [{required}] {item.live_path} -> {status}")
+    print(f"  配置目录: {SWITCHER_HOME}")
+    return 0
+
+
+def default_backup_path() -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return HOME / "Desktop" / f"codex-account-switcher-backup-{timestamp}.zip"
+
+
+def export_backup_command(output_path: str | None) -> int:
+    profiles = list_profiles()
+    target = Path(output_path).expanduser() if output_path else default_backup_path()
+    if target.suffix.lower() != ".zip":
+        target = target.with_suffix(".zip")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if STATE_FILE.exists():
+            archive.write(STATE_FILE, arcname="state.json")
+        if PROFILES_DIR.exists():
+            for path in sorted(PROFILES_DIR.rglob("*")):
+                if path.is_dir():
+                    continue
+                archive.write(path, arcname=str(Path("profiles") / path.relative_to(PROFILES_DIR)))
+
+        manifest = {
+            "exported_at": now_iso(),
+            "profile_count": len(profiles),
+            "profiles": [profile.get("profile_name") for profile in profiles],
+        }
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+
+    print(f"已导出 {len(profiles)} 个档案到 {target}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-account-switcher",
+        description="保存多个 Codex 登录态，并通过档案快速切换。",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    save_parser = subparsers.add_parser("save", help="保存当前登录态为一个档案")
+    save_parser.add_argument("name", nargs="?", help="档案名，不传则自动生成")
+    save_parser.add_argument("--force", action="store_true", help="允许强制覆盖同名档案")
+
+    subparsers.add_parser("list", aliases=["ls"], help="列出已保存档案")
+    subparsers.add_parser("current", help="显示当前登录账号")
+    subparsers.add_parser("profiles-json", help="以 JSON 输出已保存档案")
+    subparsers.add_parser("profiles-usage-json", help="以 JSON 输出已保存档案及各自的 Codex 额度")
+    subparsers.add_parser("profiles-usage-cached-json", help="以 JSON 输出已保存档案及缓存额度，适合快速展示")
+    subparsers.add_parser("current-profile-usage-json", help="以 JSON 输出当前档案及其实时 Codex 额度")
+    subparsers.add_parser("current-json", help="以 JSON 输出当前登录账号")
+    subparsers.add_parser("usage", help="显示当前 Codex 用量")
+    subparsers.add_parser("usage-json", help="以 JSON 输出当前 Codex 用量")
+    subparsers.add_parser("ensure-current-saved", help="自动保存当前未纳入管理的新账号")
+    export_parser = subparsers.add_parser("export-backup", aliases=["backup"], help="导出所有档案为 zip 备份")
+    export_parser.add_argument("output_path", nargs="?", help="备份 zip 输出路径，不传则默认导出到桌面")
+
+    switch_parser = subparsers.add_parser("switch", help="切换到指定档案")
+    switch_parser.add_argument("name", help="要切换到的档案名")
+
+    rename_parser = subparsers.add_parser("rename", help="重命名一个档案")
+    rename_parser.add_argument("old_name", help="原档案名")
+    rename_parser.add_argument("new_name", help="新档案名")
+
+    menu_parser = subparsers.add_parser("menu", help="弹出原生选择框并切换")
+    menu_parser.description = "弹出原生 macOS 列表，选择后切换并重启 Codex。"
+
+    delete_parser = subparsers.add_parser("delete", help="删除一个档案")
+    delete_parser.add_argument("name", help="要删除的档案名")
+
+    subparsers.add_parser("doctor", help="检查本机所需文件是否存在")
+    return parser
+
+
+class FileLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle: Any = None
+
+    def __enter__(self) -> "FileLock":
+        ensure_layout()
+        self.handle = self.path.open("w", encoding="utf-8")
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.handle is None:
+            return
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ensure_layout()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    command = args.command or "menu"
+    with FileLock(LOCK_FILE):
+        if command == "save":
+            return save_command(args.name, args.force)
+        if command in {"list", "ls"}:
+            return print_profiles()
+        if command == "current":
+            return print_current_account()
+        if command == "profiles-json":
+            return print_profiles_json()
+        if command == "profiles-usage-json":
+            return print_profiles_usage_json()
+        if command == "profiles-usage-cached-json":
+            return print_profiles_usage_cached_json()
+        if command == "current-profile-usage-json":
+            return print_current_profile_usage_json()
+        if command == "current-json":
+            return print_current_account_json()
+        if command == "usage":
+            return print_usage()
+        if command == "usage-json":
+            return print_usage_json()
+        if command == "ensure-current-saved":
+            return ensure_current_saved_command()
+        if command in {"export-backup", "backup"}:
+            return export_backup_command(args.output_path)
+        if command == "switch":
+            return switch_command(args.name)
+        if command == "rename":
+            return rename_command(args.old_name, args.new_name)
+        if command == "menu":
+            return menu_command()
+        if command == "delete":
+            return delete_command(args.name)
+        if command == "doctor":
+            return doctor_command()
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except SwitcherError as error:
+        print(f"错误: {error}", file=sys.stderr)
+        raise SystemExit(1)
